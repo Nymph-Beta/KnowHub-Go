@@ -1,0 +1,19 @@
+server:
+  port: "8081"
+  mode: "debug"
+
+log:
+  level: "debug"
+  format: "json"
+  # format: "console"
+  output_path: "./logs"
+  error_output_path: "./logs/error.log"
+  maxsize: 100
+  maxbackups: 10
+  maxage: 30
+  compress: true
+  time_format: "2006-01-02 15:04:05.000"
+
+database:
+  mysql:
+    dsn: "root:PaiSmart2025@tcp(127.0.0.1:3307)/PaiSmart?parseTime=True"
