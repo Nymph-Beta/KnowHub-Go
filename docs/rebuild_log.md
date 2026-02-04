@@ -295,4 +295,113 @@ func GetLogger() *zap.Logger {
 	return zapLogger
 }
 ```
-#### 4. 设计User模型
+#### 4. 设计User模型、
+
+参考数据库中数据类型来写
+
+更新：`user.go`
+
+具体细节：
+- `gorm:"primaryKey;autoIncrement` : 声明主键以及主键自增。即插入时不写 ID，数据库会自动分配下一个整数。
+- `json:"-"`：序列化成 JSON 时忽略该字段，即使用 json.Marshal(user) 或框架自动把 User 转 JSON，也不会把 Password 返回给前端，避免密码泄露。
+- `gorm:"autoCreateTime"` 和 ` gorm:"autoUpdateTime" `：创建时自动设为当前时间。插入新记录时，不用手动填 CreatedAt，GORM 会帮你写。每次更新时自动刷新为当前时间。只要执行 Update/Save，UpdatedAt 就会更新。
+- `TableName() `：GORM 默认用结构体名的复数、蛇形来猜表名：`User → users`。实现 `TableName()` 可以显式指定表名，例如固定为 `"users"`。
+-  Role 字段为什么用 enum？ :`gorm:"type:enum('USER', 'ADMIN');default:'USER'" `表示在数据库里该列是 MySQL ENUM 类型，只允许 `USER` 或 `ADMIN`，默认 `USER`。
+
+| 设计点                     | 作用                                     |
+| :------------------------- | :--------------------------------------- |
+| 主键 + 自增                | 唯一标识每条用户，且不用手写 ID。        |
+| 唯一 + 非空（如 Username） | 登录名不重复、必填。                     |
+| 密码 json:"-"              | 不在任何 JSON 里输出，保护密码。         |
+| Role 用 enum               | 角色只在有限集合内，数据库和代码都一致。 |
+| CreatedAt / UpdatedAt      | 自动记录创建与修改时间，便于排查和审计。 |
+| TableName()                | 明确表名为 users，不依赖 GORM 默认规则。 |
+
+整体上，这张表做到了：有唯一主键、有创建/修改时间、敏感字段不出网、角色有约束，是常见的用户表设计方式。
+
+#### 5. 实现数据库连接模块
+
+更新：创建 `pkg/database/mysql.go`
+- 使用全局变量DB： 为了“全进程共用一个 DB 实例、各处直接用”，属于单例式的设计。
+- 连接失败时调用 `log.Fatal` : 打日志并调用 os.Exit(1)，进程直接退出。后续可更改设计，使其更灵活
+- 连接池： 程序启动后预先建好一批到 MySQL 的 TCP 连接，放在池子里；每次要执行 SQL 时从池里取一条连接用，用完后还回池里，而不是每次请求都新建、用完就关。
+
+设计思路：
+- 启动时初始化、全进程单例
+InitMySQL(dsn) 在 main 里调用一次，成功后把 *gorm.DB 存到包级变量 DB，后续所有业务通过 database.DB 访问，不再重复建连。
+- 把「能否正常服务」和「连库是否成功」绑定
+连不上就 log.Fatal 退出，保证进程里只要存在，就认为 DB 已经可用，不做「DB 未初始化仍继续跑」的复杂分支。
+- 显式配置连接池，面向常驻进程
+用 DB.DB() 拿到底层 *sql.DB，设置 MaxIdleConns、MaxOpenConns、ConnMaxLifetime，适合多请求并发的长驻服务，而不是一次性脚本。
+- 包职责单一
+pkg/database 只负责「建连 + 配置连接池 + 暴露 DB」，不关心业务和路由，方便在 main 里先 config → log → database 再起 HTTP。
+整体上：用全局 DB 单例 + 启动时一次初始化 + 失败即 Fatal + 连接池配置，是小型/中型 Go 服务里很常见的一种简单、清晰的数据库接入方式。
+
+**注意：**
+
+对于是否采用之前实现的zapLogger + GetLogger()来记录
+- 仅就「初始化这段代码」本身，这里几乎不会执行业务 SQL，所以这段初始化代码本身不依赖 zapLogger + GetLogger() 也能把该记的记全。只为“初始化 MySQL 这几行”的话，不加 zapLogger + GetLogger() 也够用。
+- 从「整条链路日志都进 zap」的角度，若希望“所有 GORM SQL 都进 zap”，就需要在初始化时加上 zapLogger + GetLogger()（在 gorm.Open 时传入 zapgorm2）。
+**这里需要之后思考**
+
+#### 6. 实现 AutoMigrate
+该环节与原项目实现不同：
+1. cmd/server/main.go 里没有 AutoMigrate
+    在 `main.go` 里只有：`database.InitMySQL(cfg.Database.MySQL.DSN)`
+    没有任何 `database.DB.AutoMigrate(...)` 或其它迁移调用。
+    `pkg/database/mysql.go` 里的 `InitMySQL` 也只做连接和连接池配置，没有执行迁移。
+
+2. 项目里的“自动建表”是在哪里做的
+    项目没有用 GORM 自动建表，而是用 MySQL 容器首次启动时执行 DDL：
+    在 `deployments/docker-compose.yaml` 里有：`docker-compose.yaml`
+    MySQL 官方镜像会在第一次启动时执行 /docker-entrypoint-initdb.d/ 下的 .sql 文件。
+
+  因此：
+  自动建表 = 把 docs/ddl.sql 挂到 docker-entrypoint-initdb.d/001-ddl.sql，由 MySQL 在容器首次初始化时执行，创建 users、organization_tags、file_upload、chunk_info、document_vectors 等表。
+
+  也就是说：“自动建表”是在 Docker 部署里通过 MySQL 的 init 脚本（docs/ddl.sql）实现的，不是在 Go 代码里用 AutoMigrate 实现的。
+
+实现思路：
+1. 学习 GORM 完整能力
+  AutoMigrate 是 GORM 的核心功能之一，很多项目（特别是小型项目）都用它
+2. 开发更方便
+  改 struct → 重启程序 → 表结构自动更新，不用每次改 SQL 文件
+3. 后续可以切换
+  理解原理后，生产部署时可以改回 DDL 方式，两种方式不冲突
+
+**原项目方式**：通过 `docs/ddl.sql` + Docker 挂载实现
+- 优点：生产环境更安全，完全控制表结构
+- 缺点：需要手动维护 SQL 和 Model 一致性
+
+**本项目选择**：开发阶段使用 `db.AutoMigrate()`
+- 优点：学习 GORM 能力，开发迭代方便
+- 注意：生产部署时可考虑切换为 DDL 文件方式
+
+具体实现：
+- 在 `pkg/database/mysql.go` 末尾添加`RunMigrations()`,
+```go
+// RunMigrations 执行数据库表结构迁移（开发阶段使用）
+// 使用 GORM AutoMigrate 根据 model 自动创建/更新表结构
+func RunMigrations() error {
+	log.Info("开始执行数据库表结构迁移...")
+
+	// 按照依赖顺序迁移表
+	if err := DB.AutoMigrate(
+		&model.User{},
+		// 后续阶段会继续添加：
+		// &model.OrgTag{},          // 阶段 5
+		// &model.Upload{},          // 阶段 6-7
+		// &model.ChunkInfo{},       // 阶段 7
+		// &model.DocumentVector{},  // 阶段 10
+	); err != nil {
+		log.Errorf("AutoMigrate 失败: %v", err)
+		return err
+	}
+
+	log.Info("数据库表结构迁移完成")
+	return nil
+}
+```
+- 在 `cmd/server/main.go` 的 `database.InitMySQL(...)` 后面添加：`database.RunMigrations()`
+- 新建数据库为PaiSmart_v2
+- 在开发最后切换为 Docker 挂载方式
