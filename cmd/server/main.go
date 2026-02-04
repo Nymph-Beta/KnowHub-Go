@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"pai_smart_go_v2/internal/config"
 	"pai_smart_go_v2/internal/middleware"
+	"pai_smart_go_v2/pkg/database"
 	"pai_smart_go_v2/pkg/log"
 
 	"net/http"
@@ -28,7 +29,13 @@ func main() {
 
 	log.Info("Server started")
 
-	GormDemo()
+	// GormDemo()
+
+	database.InitMySQL(cfg.Database.MySQL.DSN)
+	if err := database.RunMigrate(); err != nil {
+		log.Fatal("Failed to run migrations", err)
+		return
+	}
 	// TestLog()
 
 	// router := gin.Default()
@@ -36,6 +43,7 @@ func main() {
 	// 	c.JSON(200, gin.H{"message": "pong"})
 	// })
 	// router.Run(":" + cfg.Server.Port)
+
 	gin.SetMode(cfg.Server.Mode)
 	r := gin.New()
 	r.Use(middleware.RequestLogger(), gin.Recovery())
