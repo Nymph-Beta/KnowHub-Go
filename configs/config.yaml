@@ -17,3 +17,8 @@ log:
 database:
   mysql:
     dsn: "root:PaiSmart2025@tcp(127.0.0.1:3307)/paismart_v2?parseTime=True"
+
+jwt:
+  secret: "PXrQbuCwXwOZzkML/Vm2S5rSwt1iybvmKtGDzVEu+Hc="
+  access_token_expire_hours: 24
+  refresh_token_expire_days: 7

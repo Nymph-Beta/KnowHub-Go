@@ -42,6 +42,12 @@ type MySQLConfig struct {
 	DSN string `mapstructure:"dsn"`
 }
 
+type JWTConfig struct {
+	Secret                 string `mapstructure:"secret"`
+	AccessTokenExpireHours int    `mapstructure:"access_token_expire_hours"`
+	RefreshTokenExpireDays int    `mapstructure:"refresh_token_expire_days"`
+}
+
 // init 初始化配置加载，从指定的路径读取 YAML 配置文件并解析导入到 Conf 变量中
 func Init(configPath string) {
 	viper.SetConfigFile(configPath)
