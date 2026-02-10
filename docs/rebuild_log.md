@@ -363,11 +363,11 @@ pkg/database 只负责「建连 + 配置连接池 + 暴露 DB」，不关心业�
 
 实现思路：
 1. 学习 GORM 完整能力
-  AutoMigrate 是 GORM 的核心功能之一，很多项目（特别是小型项目）都用它
+    AutoMigrate 是 GORM 的核心功能之一，很多项目（特别是小型项目）都用它
 2. 开发更方便
-  改 struct → 重启程序 → 表结构自动更新，不用每次改 SQL 文件
+    改 struct → 重启程序 → 表结构自动更新，不用每次改 SQL 文件
 3. 后续可以切换
-  理解原理后，生产部署时可以改回 DDL 方式，两种方式不冲突
+    理解原理后，生产部署时可以改回 DDL 方式，两种方式不冲突
 
 **原项目方式**：通过 `docs/ddl.sql` + Docker 挂载实现
 - 优点：生产环境更安全，完全控制表结构
@@ -405,3 +405,118 @@ func RunMigrations() error {
 - 在 `cmd/server/main.go` 的 `database.InitMySQL(...)` 后面添加：`database.RunMigrations()`
 - 新建数据库为PaiSmart_v2
 - 在开发最后切换为 Docker 挂载方式
+
+### 阶段四 用户认证（JWT）
+#### 1. 理解分层架构
+
+原项目中的三层架构设计：
+- Handler层： 只负责HTTP协议。负责解析请求体、调用Service、格式化响应
+- Service层： 业务逻辑编排。负责协调多个Repository、实现业务规则（密码验证、Token生成）、事务管理
+- Respository层： 只负责数据库操作。负责执行SQL查询、ORM映射、返回数据模型
+
+
+如果不使用三层架构，直接在Handler里写SQL，会导致：
+- 🔴 无法复用：如果另一个Handler也需要登录逻辑，必须复制粘贴
+- 🔴 难以测试：要测试登录逻辑，必须启动整个HTTP服务器
+- 🔴 紧耦合：修改数据库查询方式，必须改所有Handler
+- 🔴 可读性差：一个函数包含HTTP、业务、数据库逻辑，超过100行
+
+举例说明：
+- 代码复用： `FindByUsername`函数被多个地方调用，如果在Handler中写SQL，会多次复制
+- 业务逻辑服用： 比如用户注册逻辑，该流程设计多个Repository和数据库操作，若不使用三层架构，逻辑很臃肿
+- 单元测试： 分层可以独立测试每一层
+- 技术栈迁移： 假设未来要把数据库从MySQL换成PostgreSQL：分层架构只需修改 Repository 实现 ，Handler 和 Service 无需改动
+
+为什么 Repository 要定义接口（interface）？
+- 为了以来倒置和可测试性。
+- Service依赖的是接口，而不是具体实现，比如用户注册，可以传入任何实现`UserRespository`的对象
+- 可以轻松切换实现（MySql或postgreSQL等）
+- 单元测试不需要数据库
+
+```go
+Repository → Service → Handler
+     ↓          ↓         ↓
+   数据访问   业务逻辑   HTTP处理
+```
+
+####  2. 扩展配置文件
+更新： config.yaml
+```yaml
+jwt:
+  secret: "JWT 签名密钥, 一个 Base64 编码的 32 字节（256 位）随机数据，通常通过 openssl rand -base64 32 之类的命令生成。"
+  access_token_expire_hours: Access Token 过期时间, 用户每次请求 API 时携带的短期凭证，用于身份验证。
+  refresh_token_expire_days: Refresh Token 过期时间, 用于在 Access Token 过期后，免登录地获取新的 Access Token。它存储在客户端（通常是 HttpOnly Cookie 或安全存储中），生命周期更长。
+```
+
+#### 3. 实现密码加密模块
+
+更新：新增 `pkg/hash/bcrypy.go`
+参考资料：`https://pkg.go.dev/golang.org/x/crypto/bcrypt`
+
+使用两个核心函数：
+```go
+func HashPassword(password string) (string, error) {
+  hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+}
+func CheckPasswordHash(password, hash string) bool {
+  return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+}
+```
+
+- bcrypt.DefaultCost 是 golang.org/x/crypto/bcrypt 包中定义的常量，值为 10。它代表 bcrypt 算法的工作因子（work factor），即内部哈希迭代次数的指数：实际迭代次数为 2^cost 次
+- cost 用于对抗硬件提升、可调节时间成本、并且可以向前兼容。
+- 相比于MD5/SHA256，bcrypt专为密码存储设计。通过cost调节速度，自动生成并嵌入结果中，并且bcrypt 内存访问模式对 GPU 不友好
+
+CheckPasswordHash 为什么返回 bool 而不是 error？
+底层的 `bcrypt.CompareHashAndPassword` 实际上是返回 `error` 的——密码不匹配时返回 bcrypt.ErrMismatchedHashAndPassword，格式错误时也会返回相应的 `error`。
+
+这里封装成 bool 是一个有意的简化设计，原因是：
+- 调用方只关心"对不对"：在登录场景中，不论是密码错误还是哈希格式损坏，对用户的响应都是一样的——"认证失败"。区分具体错误类型对业务逻辑没有意义，反而会增加调用方的代码复杂度。
+- 安全考量：向外暴露具体的错误类型（如"哈希格式无效" vs "密码不匹配"）可能给攻击者提供信息泄露的机会（信息枚举攻击）。
+- API 简洁性：`if !CheckPasswordHash(pwd, hash)` 比 `if err := CheckPasswordHash(pwd, hash); err != nil` 更直观。
+
+
+#### 4. 实现 JWT 模块
+
+新建： pkg/token/jwt.go
+
+JWT（JSON Web Token）是一种开放标准（RFC 7519），用于在各方之间以 JSON 对象 的形式安全传输信息。它通过数字签名（HMAC、RSA 或 ECDSA）来保证信息可验证、可信任。
+
+使用场景：
+- 授权（Authorization）：用户登录后，后续每个请求携带 JWT，服务端据此判断是否允许访问资源。
+- 信息交换：签名确保发送方身份和内容未被篡改。
+
+主要结构是三段式：
+
+一个 JWT ：xxxxx.yyyyy.zzzzz，由 . 分隔为三部分：
+
+| 部分      | 内容           | 说明                                                    |
+| :-------- | :------------- | :------------------------------------------------------ |
+| Header    | 算法 + 类型    | 如 {"alg": "HS256", "typ": "JWT"}                       |
+| Payload   | Claims（声明） | 用户信息、过期时间等，如 {"sub": "123", "name": "John"} |
+| Signature | 签名           | 用 Header + Payload + 密钥 生成，防篡改                 |
+
+每部分都经过 Base64Url 编码。
+
+主要工作流程：
+1. 客户端用账号密码登录
+2. 服务端验证后返回一个 JWT
+3. 客户端之后每次请求在 Authorization: Bearer <token> 头中携带该 JWT
+4. 服务端验证 JWT 有效后，允许访问受保护资源
+
+代码设计思路：
+```
+密钥 + 过期时间 → 封装进一个结构体 → 暴露 Generate / Verify 方法
+```
+
+`pkg/token/jwt.go` 基于 `golang-jwt/jwt/v5` 实现，核心结构：
+
+- **JWTManager**：封装密钥和过期时间，暴露 `GenerateToken` / `VerifyToken` 两个方法
+- **CustomClaims**：嵌入 `jwt.RegisteredClaims`（标准字段 iss/exp/iat/nbf），扩展 UserID、Username、Role、TokenType
+- **双 Token 机制**：`GenerateToken` 同时返回 access token（短期）和 refresh token（长期）
+- **签名算法**：使用 HMAC-SHA256（对称密钥，签名和验证用同一个 secret）
+
+改动记录：
+
+1. **添加 TokenType 字段**：CustomClaims 增加 `token_type` 字段（值为 `"access"` 或 `"refresh"`），防止攻击者拿 refresh token 冒充 access token 调用 API。业务层中间件通过检查 `claims.TokenType` 来区分。
+2. **WithValidMethods 替代手动类型断言**：VerifyToken 中原先通过 `token.Method.(*jwt.SigningMethodHMAC)` 手动检查算法类型（允许 HS256/384/512 三种），改为使用 `jwt.WithValidMethods([]string{"HS256"})` 精确限制只允许 HS256，更符合 v5 API 风格，防止算法篡改攻击。
