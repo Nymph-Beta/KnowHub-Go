@@ -4,9 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"pai_smart_go_v2/internal/config"
+	"pai_smart_go_v2/internal/handler"
 	"pai_smart_go_v2/internal/middleware"
+	"pai_smart_go_v2/internal/repository"
+	"pai_smart_go_v2/internal/service"
 	"pai_smart_go_v2/pkg/database"
 	"pai_smart_go_v2/pkg/log"
+	"pai_smart_go_v2/pkg/token"
 
 	"net/http"
 	"os"
@@ -44,9 +48,39 @@ func main() {
 	// })
 	// router.Run(":" + cfg.Server.Port)
 
+	// 1. Repository
+	userRepo := repository.NewUserRepository(database.DB)
+
+	// 2. JWT Manager
+	jwtManager := token.NewJWTManager(
+		cfg.JWT.Secret,
+		time.Duration(cfg.JWT.AccessTokenExpireHours)*time.Hour,
+		time.Duration(cfg.JWT.RefreshTokenExpireDays)*24*time.Hour,
+	)
+
+	// 3. Service (注入 Repository 和 JWTManager)
+	userService := service.NewUserService(userRepo, jwtManager)
+
+	// 4. Handler (注入 Service)
+	userHandler := handler.NewUserHandler(userService)
+
+	// 4. 设置 Gin 模式
 	gin.SetMode(cfg.Server.Mode)
 	r := gin.New()
 	r.Use(middleware.RequestLogger(), gin.Recovery())
+
+	// 5. 路由
+	users := r.Group("/api/v1/users")
+	{
+		users.POST("/register", userHandler.Register)
+		users.POST("/login", userHandler.Login)
+
+		authed := users.Group("/")
+		authed.Use(middleware.AuthMiddleware(jwtManager, userService))
+		{
+			authed.GET("/me", userHandler.GetProfile)
+		}
+	}
 
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "pong"})
