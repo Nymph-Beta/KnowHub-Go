@@ -20,6 +20,7 @@ go.work
 # IDE and editor files
 .idea/
 .vscode/
+.specstory/
 *.swp
 *.swo
 *~

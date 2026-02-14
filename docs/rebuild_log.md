@@ -520,3 +520,42 @@ JWT（JSON Web Token）是一种开放标准（RFC 7519），用于在各方之�
 
 1. **添加 TokenType 字段**：CustomClaims 增加 `token_type` 字段（值为 `"access"` 或 `"refresh"`），防止攻击者拿 refresh token 冒充 access token 调用 API。业务层中间件通过检查 `claims.TokenType` 来区分。
 2. **WithValidMethods 替代手动类型断言**：VerifyToken 中原先通过 `token.Method.(*jwt.SigningMethodHMAC)` 手动检查算法类型（允许 HS256/384/512 三种），改为使用 `jwt.WithValidMethods([]string{"HS256"})` 精确限制只允许 HS256，更符合 v5 API 风格，防止算法篡改攻击。
+
+
+#### 5. 实现 Repository 层
+具体实现： `internal/repository/user_repository.go`
+
+设计思路： 接口 + 结构体实现
+1. 接口和实现分离
+  先定义 UserRepository 接口。
+  ```go
+  type UserRepository interface {
+   // 定义的用户数据的各个持久化操作
+  }
+  ```
+  再定义userRepository ： UserRepository 接口的 GORM 实现。
+  ```go
+  type userRepository struct {
+    db *gorm.DB
+  }
+  ```
+  - UserRepository（大写 U）：公开的接口，定义"能做什么"
+  - userRepository（小写 u）：私有的结构体，定义"怎么做"
+  外部包只能看到接口，看不到具体实现。这就是 Go 的封装方式。
+
+2. 工厂函数返回接口类型
+  ```go
+  // NewUserRepository 创建一个新的 UserRepository 实例。
+  func NewUserRepository(db *gorm.DB) UserRepository {
+    return &userRepository{db: db}
+  }
+  ```
+  NewUserRepository 接受一个 *gorm.DB 参数，返回的是接口类型 UserRepository，而不是具体的 *userRepository。调用者永远不知道底层实现是什么。
+
+  优势：
+  1. 解耦 —— Service 层不依赖具体的数据库实现
+    - Service 只知道"有一个 UserRepository 接口，它能 Create、FindByUsername 等"，但完全不知道底层用的是 GORM、还是原生 SQL、还是 MongoDB。这就是依赖倒置原则 (DIP)。
+  2. 方便测试
+    - 因为 Service 依赖的是接口，在写单元测试时，可以创建一个 Mock 实现，不需要连接真实数据库
+  3. 可替换性 —— 换数据库只改 Repository 层
+
