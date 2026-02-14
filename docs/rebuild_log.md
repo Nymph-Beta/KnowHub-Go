@@ -478,7 +478,7 @@ CheckPasswordHash 为什么返回 bool 而不是 error？
 
 #### 4. 实现 JWT 模块
 
-新建： pkg/token/jwt.go
+新建： `pkg/token/jwt.go` `pkg/token/jwt_test.go`
 
 JWT（JSON Web Token）是一种开放标准（RFC 7519），用于在各方之间以 JSON 对象 的形式安全传输信息。它通过数字签名（HMAC、RSA 或 ECDSA）来保证信息可验证、可信任。
 
@@ -523,7 +523,7 @@ JWT（JSON Web Token）是一种开放标准（RFC 7519），用于在各方之�
 
 
 #### 5. 实现 Repository 层
-具体实现： `internal/repository/user_repository.go`
+具体实现： `internal/repository/user_repository.go` `internal/repository/user_repository_test.go`
 
 设计思路： 接口 + 结构体实现
 1. 接口和实现分离
@@ -558,4 +558,305 @@ JWT（JSON Web Token）是一种开放标准（RFC 7519），用于在各方之�
   2. 方便测试
     - 因为 Service 依赖的是接口，在写单元测试时，可以创建一个 Mock 实现，不需要连接真实数据库
   3. 可替换性 —— 换数据库只改 Repository 层
+---
+#### 6. 实现 Service 层
 
+更新内容： `internal/service/user_service.go`  `internal/service/user_service_test.go`
+
+先完成用户相关 Service ，不含组织标签的逻辑
+
+实现：
+```go
+type UserService interface {
+    Register(username, password string) (*model.User, error)
+    Login(username, password string) (accessToken string, err error)
+    GetProfile(username string) (*model.User, error)
+}
+```
+
+Service 层处于中间位置，向上为 Handler 提供简洁的业务接口（一个方法调用完成整个业务），向下通过组合多个 Repository 和工具包来实现复杂的业务流程。
+
+登录失败应该返回"用户不存在"还是"凭证无效"？
+- 应该统一返回"凭证无效"（即 ErrInvalidCredentials），这是正确的做法。否则可能会被枚举攻击。
+
+Service 层应该调用 log 记录日志吗？
+- 对于目前的项目阶段，当前在 Service 里直接用 log.Errorf 是可以的，先把功能做通。等后续项目复杂了，再考虑将 logger 改为依赖注入的方式。
+
+#### 7. 实现 Handler 层
+
+更新： `internal/handler/user_handler.go` `internal/handler/user_handler_test.go`
+
+```go
+type UserHandler struct {
+    userService service.UserService
+}
+
+// 请求体结构
+type RegisterRequest struct {
+    Username string `json:"username" binding:"required"`
+    Password string `json:"password" binding:"required"`
+}
+
+// Handler 方法
+func (h *UserHandler) Register(c *gin.Context) { ... }
+func (h *UserHandler) Login(c *gin.Context) { ... }
+func (h *UserHandler) GetProfile(c *gin.Context) { ... }
+```
+
+##### 知识点
+
+**`binding:"required"` 与 Gin 参数验证**
+
+- 结构体标签可以有多个，用空格隔开：`json:"username"` 负责 JSON 序列化，`binding:"required"` 负责验证。
+- Gin 底层使用 [go-playground/validator](https://github.com/go-playground/validator) 库。
+- `binding:"required"` 表示字段必须存在且不能为零值（空字符串、0、nil）。
+- 常用验证规则示例：
+  - `binding:"required,min=3,max=32"` — 必填，3-32 字符
+  - `binding:"required,email"` — 必须是邮箱格式
+  - `binding:"oneof=USER ADMIN"` — 枚举值限制
+  - `binding:"omitempty,gte=0,lte=150"` — 可选，但传了就必须在范围内
+
+**`c.ShouldBindJSON()` vs `c.BindJSON()`**
+
+- `ShouldBindJSON`：验证失败只返回 error，不自动写响应，由开发者自己控制返回格式。**推荐使用。**
+- `BindJSON`：验证失败会自动调用 `c.AbortWithError(400, err)` 写一个不可定制的响应，失去控制权。
+- 结论：几乎所有情况都用 `Should` 前缀的方法（`ShouldBindJSON`、`ShouldBindQuery`、`ShouldBindUri`）。
+
+**HTTP 状态码选择**
+
+| 状态码 | 含义 | 本项目场景 |
+|-------|------|----------|
+| 200 OK | 请求成功 | Login 成功、GetProfile 成功 |
+| 201 Created | 成功创建新资源 | Register 成功 |
+| 400 Bad Request | 请求格式错误 | JSON 解析失败、缺少必填字段 |
+| 401 Unauthorized | 身份验证失败 | 登录密码错误、Token 无效/过期 |
+| 403 Forbidden | 有身份但没权限 | 普通用户访问管理员接口 |
+| 404 Not Found | 资源不存在 | GetProfile 查无此用户 |
+| 409 Conflict | 资源冲突 | 注册时用户名已存在 |
+| 500 Internal Server Error | 服务器内部出错 | 数据库挂了、Token 生成失败 |
+
+- 401 vs 403：401 是"不知道你是谁"（未认证），403 是"知道你是谁但没权限"（已认证但未授权）。
+
+**Handler 层错误处理要点**
+
+- 用 `mapServiceError()` 将 Service 哨兵错误映射到正确的 HTTP 状态码，避免所有错误都返回 500。
+- 错误分支必须 `return`，否则会继续执行成功响应，导致重复写响应。
+- 对外响应不包含 `err.Error()`，避免泄露数据库/内部实现细节。
+- `c.Get()` 返回 `any` 类型，使用前需要类型断言：`user, ok := userVal.(*model.User)`。
+
+#### 8. 实现 Auth 中间件
+更新：`internal/middleware/auth.go`
+
+##### 整体流程
+
+```
+请求进来 → [AuthMiddleware] → 通过 → Handler 处理业务
+                │
+                ├─ 0. 依赖检查（jwtManager/userService 是否为 nil）
+                ├─ 1. 提取 Bearer Token
+                ├─ 2. 验证 Token 签名和有效期
+                ├─ 3. 检查 Token 类型（必须是 access）
+                ├─ 4. 查数据库确认用户存在
+                ├─ 5. 注入 claims 和 user 到上下文
+                └─ 6. c.Next() 放行
+                │
+                └─→ 任一步失败 → AbortWithStatusJSON → 请求到此结束
+```
+
+##### 第零步：防御性检查
+
+```go
+if jwtManager == nil || userService == nil {
+    c.AbortWithStatusJSON(http.StatusInternalServerError, ...)
+    return
+}
+```
+确保依赖已正确注入，防止后续代码 nil panic。
+
+##### 第一步：提取 Bearer Token
+
+```go
+tokenString, err := extractBearerToken(c.GetHeader("Authorization"))
+```
+从 HTTP 请求头 `Authorization: Bearer xxxxx` 中提取出 Token 字符串。Bearer 是 OAuth 2.0 / JWT 的行业标准格式。
+
+`extractBearerToken` 的实现改进：
+- 用 `strings.Fields` 替代 `HasPrefix + TrimPrefix`，自动处理多余空格
+- 用 `strings.EqualFold` 做大小写不敏感比较，兼容 `bearer`、`BEARER` 等写法
+
+##### 第二步：验证 Token
+
+```go
+claims, err := jwtManager.VerifyToken(tokenString)
+if err != nil || claims == nil {
+    c.AbortWithStatusJSON(http.StatusUnauthorized, ...)
+    return
+}
+```
+调用 `jwtManager.VerifyToken` 检查 Token 签名是否正确、是否过期。验证失败就 Abort（中止），请求到此结束，不会到达 Handler。
+
+##### 第三步：检查 Token 类型
+
+```go
+if claims.TokenType != token.TokenTypeAccess {
+    c.AbortWithStatusJSON(http.StatusUnauthorized, ...)
+    return
+}
+```
+受保护接口只接受 access token，拒绝 refresh token。防止攻击者拿 refresh token 冒充 access token 来访问 API（这就是为什么 `jwt.go` 中要区分 `TokenTypeAccess` 和 `TokenTypeRefresh`）。
+
+##### 第四步：查数据库确认用户存在
+
+```go
+user, err := userService.GetProfile(claims.Username)
+if err != nil {
+    switch {
+    case errors.Is(err, service.ErrUserNotFound):
+        // 用户已删除 → 401
+    default:
+        // 数据库错误 → 500（不泄露细节）
+    }
+    return
+}
+```
+即使 Token 有效，用户也可能已被删除或禁用，所以需要查一次数据库确认。错误处理使用 Service 层的哨兵错误做精确匹配。
+
+##### 第五步：注入上下文 + 放行
+
+```go
+c.Set("claims", claims)  // 后续 Handler 通过 c.Get("claims") 获取 JWT Claims
+c.Set("user", user)      // 后续 Handler 通过 c.Get("user") 获取 *model.User
+c.Next()                  // 放行，继续执行下一个中间件或 Handler
+```
+注意：`c.Get("user")` 返回的是 `any` 类型，Handler 中使用时需要类型断言 `user, ok := userVal.(*model.User)`。
+
+##### 学到的知识点
+
+**Gin 中间件的核心 API：**
+- `c.Abort()` — 中止请求链，后续的中间件和 Handler 都不会执行
+- `c.AbortWithStatusJSON()` — 中止 + 写 JSON 响应，一步到位
+- `c.Next()` — 放行，继续执行下一个中间件或 Handler
+- `c.Set(key, value)` / `c.Get(key)` — 在中间件和 Handler 之间传递数据
+
+**`c.AbortWithStatusJSON()` vs `c.JSON()` 的区别：**
+
+核心区别是**是否中止请求链**：
+- `c.JSON()` — 只写 JSON 响应，不影响代码流程，后续中间件和 Handler 照常执行
+- `c.AbortWithStatusJSON()` — 写 JSON 响应 + 中止请求链，后续中间件和 Handler 不再执行
+
+```
+请求 → 中间件A → 中间件B → Handler
+
+中间件A 调 c.JSON() + return       → 中间件B 会执行，Handler 会执行
+中间件A 调 c.AbortWithStatusJSON() → 中间件B 不执行，Handler 不执行
+```
+
+使用场景：
+- **中间件里** — 用 `c.AbortWithStatusJSON()`，阻止请求继续往下走到 Handler
+- **Handler 里** — 用 `c.JSON()` + `return`，Handler 是请求链最后一环，不需要 Abort
+
+注意：`c.Abort()` 不会终止当前函数的执行，它只是设置了一个标志位。所以 Abort 后仍需手动 `return`，否则当前函数后面的代码还会跑。
+
+**为什么 Token 要区分 access 和 refresh 类型？**
+- access token：短期有效（如 15 分钟），用于访问 API
+- refresh token：长期有效（如 24 小时），仅用于换取新的 access token
+- 如果不区分，攻击者拿到 refresh token 就能直接访问 API，refresh token 的长有效期会放大风险
+
+#### 9. 注册路由
+
+更新：`cmd/server/main.go`
+
+##### main 函数整体流程
+
+```
+1. 加载配置 config.Init()
+2. 初始化日志 log.Init()
+3. 连接数据库 database.InitMySQL() + RunMigrate()
+4. 依赖注入 Repository → JWTManager → Service → Handler
+5. 创建 Gin 引擎 + 全局中间件
+6. 注册路由
+7. 启动 HTTP 服务器 + 优雅停机
+```
+
+##### 依赖注入链
+
+依赖注入顺序体现了各层之间的依赖关系，**从底层到上层**：
+
+```go
+// 1. Repository（最底层，依赖数据库连接）
+userRepo := repository.NewUserRepository(database.DB)
+
+// 2. JWT Manager（独立组件，从配置读取密钥和过期时间）
+jwtManager := token.NewJWTManager(
+    cfg.JWT.Secret,
+    time.Duration(cfg.JWT.AccessTokenExpireHours) * time.Hour,
+    time.Duration(cfg.JWT.RefreshTokenExpireDays) * 24 * time.Hour,
+)
+
+// 3. Service（业务层，注入 Repository 和 JWTManager）
+userService := service.NewUserService(userRepo, jwtManager)
+
+// 4. Handler（接口层，注入 Service）
+userHandler := handler.NewUserHandler(userService)
+```
+
+注入链路图：
+```
+database.DB → UserRepository → UserService → UserHandler
+                                    ↑
+cfg.JWT     → JWTManager ──────────┘
+```
+
+##### 创建 Gin 引擎与全局中间件
+
+```go
+gin.SetMode(cfg.Server.Mode)               // 设置运行模式（debug/release）
+r := gin.New()                              // 创建空引擎（不带默认中间件）
+r.Use(middleware.RequestLogger(), gin.Recovery())  // 注册全局中间件
+```
+
+- `gin.New()` vs `gin.Default()`：`Default()` 自带 Logger 和 Recovery，`New()` 是空的，我们用自定义的 `RequestLogger` 替代默认 Logger
+- `gin.Recovery()` — 捕获 panic，防止服务崩溃，返回 500
+
+##### 路由注册
+
+```go
+// 用户相关路由，统一前缀 /api/v1/users
+users := r.Group("/api/v1/users")
+{
+    // 公开路由（无需认证）
+    users.POST("/register", userHandler.Register)   // POST /api/v1/users/register
+    users.POST("/login", userHandler.Login)          // POST /api/v1/users/login
+
+    // 受保护路由（需要认证）
+    authed := users.Group("/")
+    authed.Use(middleware.AuthMiddleware(jwtManager, userService))
+    {
+        authed.GET("/me", userHandler.GetProfile)    // GET /api/v1/users/me
+    }
+}
+```
+
+路由结构：
+```
+/api/v1/users
+├── POST /register          ← 公开，无需 Token
+├── POST /login             ← 公开，无需 Token
+└── [AuthMiddleware]        ← 需要 Bearer Token
+    └── GET /me             ← 受保护，返回当前用户信息
+```
+
+- `r.Group()` — 创建路由组，共享前缀和中间件
+- 只有 `authed` 组使用了 `AuthMiddleware`，所以 `/register` 和 `/login` 不需要 Token
+- 注意：**路由注册必须在 `r := gin.New()` 之后**，否则 `r` 未定义会编译报错
+
+##### 知识点
+
+**Gin 路由组（Group）的作用：**
+- 共享 URL 前缀：`r.Group("/api/v1/users")` 下的所有路由自动带 `/api/v1/users` 前缀
+- 共享中间件：`authed.Use(AuthMiddleware)` 只对 `authed` 组内的路由生效，不影响外面的公开路由
+- 可以嵌套：在 `users` 组内再创建 `authed` 子组，实现"部分路由需要认证"的效果
+
+**`gin.New()` vs `gin.Default()`：**
+- `gin.Default()` = `gin.New()` + Logger 中间件 + Recovery 中间件
+- 当你有自定义日志中间件（如 `RequestLogger`）时，用 `gin.New()` 避免重复日志
