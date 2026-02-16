@@ -37,10 +37,17 @@ type LogConfig struct {
 
 type DatabaseConfig struct {
 	MySQL MySQLConfig `mapstructure:"mysql"`
+	Redis RedisConfig `mapstructure:"redis"`
 }
 
 type MySQLConfig struct {
 	DSN string `mapstructure:"dsn"`
+}
+
+type RedisConfig struct {
+	Addr     string `mapstructure:"addr"`
+	Password string `mapstructure:"password"`
+	DB       int    `mapstructure:"db"`
 }
 
 type JWTConfig struct {

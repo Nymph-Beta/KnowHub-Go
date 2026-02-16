@@ -17,6 +17,10 @@ log:
 database:
   mysql:
     dsn: "root:PaiSmart2025@tcp(127.0.0.1:3307)/paismart_v2?parseTime=True"
+  redis: 
+    addr: "127.0.0.1:6379"
+    password: ""
+    db: 1
 
 jwt:
   secret: "PXrQbuCwXwOZzkML/Vm2S5rSwt1iybvmKtGDzVEu+Hc="
