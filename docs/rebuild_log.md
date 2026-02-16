@@ -860,3 +860,144 @@ users := r.Group("/api/v1/users")
 **`gin.New()` vs `gin.Default()`：**
 - `gin.Default()` = `gin.New()` + Logger 中间件 + Recovery 中间件
 - 当你有自定义日志中间件（如 `RequestLogger`）时，用 `gin.New()` 避免重复日志
+
+### 阶段五 Redis 集成 & 组织标签
+#### 1. 启动 Redis 并扩展配置
+该环节与原项目实现不同：
+
+1. 原项目的 Redis 是通过 `deployments/docker-compose.yaml` 启动的 Docker 容器
+
+    ```yaml
+    redis:
+      image: redis:7.2-alpine
+      ports:
+        - "6380:6379"
+      command: redis-server --bind 0.0.0.0 --port 6379 --requirepass PaiSmart2025 --appendonly yes
+    ```
+
+    docker-compose 中配置了以下参数：
+
+    | 参数 | 值 | 含义 |
+    | :--- | :--- | :--- |
+    | `--bind 0.0.0.0` | 监听所有网络接口 | 允许容器外部连接 |
+    | `--port 6379` | 容器内部端口 | Redis 的默认端口就是 **6379** |
+    | `--requirepass PaiSmart2025` | 访问密码 | 客户端连接时必须提供 |
+    | `--appendonly yes` | 开启 AOF 持久化 | 每次写操作追加到日志文件，防止数据丢失 |
+    | `ports: "6380:6379"` | 端口映射 | 宿主机 6380 → 容器内 6379 |
+
+    然后在 `configs/config.yaml` 中手动填写对应的连接信息：
+    ```yaml
+    redis:
+      addr: "127.0.0.1:6380"  # 对应 docker-compose 映射的宿主机端口
+      password: "PaiSmart2025"  # 对应 --requirepass
+      db: 0
+    ```
+
+    也就是说：Docker 层和应用层各自写了一份配置，靠开发者手动保证一致。
+
+2. `redis.Options` 中 `DB` 参数的含义
+
+    Redis 内置了 **16 个逻辑数据库**（编号 0-15），共享同一个 Redis 实例的内存，但数据互相隔离。`DB` 参数指定连接哪个逻辑数据库：
+    - `DB: 0` — 第 0 号数据库（默认值）
+    - `DB: 1` — 第 1 号数据库
+    - ... 以此类推到 `DB: 15`
+
+    典型用途：在同一个 Redis 实例上隔离不同业务的数据（如 DB 0 给缓存，DB 1 给 session）。
+
+**原项目方式**：Docker 容器启动 Redis + docker-compose 中配置参数
+- 优点：团队协作，一键 `docker compose up` 启动所有服务
+- 缺点：docker-compose.yaml 和 config.yaml 两处配置需手动保持一致
+
+**本项目选择**：使用 WSL 本地已安装的 Redis（systemd 服务），不依赖 Docker
+- 优点：开发轻量，用到什么启动什么；只维护 config.yaml 一份配置
+- 注意：部署时再统一整理到 docker-compose.yaml
+
+当前环境：
+```
+WSL 本地 Redis: 127.0.0.1:6379, 无密码, systemd 管理 (redis-server.service)
+Docker Redis:   127.0.0.1:6380, 密码 PaiSmart2025 (原项目在用，互不干扰)
+```
+
+v2 项目使用 DB 1 而非默认的 DB 0，避免与终端手动测试或其他工具的数据互相污染。
+
+具体实现：
+
+- 更新 `configs/config.yaml`，在 `database` 下添加 `redis` 配置：
+```yaml
+database:
+  mysql:
+    dsn: "root:PaiSmart2025@tcp(127.0.0.1:3307)/paismart_v2?parseTime=True"
+  redis:
+    addr: "127.0.0.1:6379"
+    password: ""
+    db: 1
+```
+
+- 更新 `internal/config/config.go`，在 `DatabaseConfig` 中添加 `RedisConfig`：
+```go
+type DatabaseConfig struct {
+	MySQL MySQLConfig `mapstructure:"mysql"`
+	Redis RedisConfig `mapstructure:"redis"`
+}
+
+type RedisConfig struct {
+	Addr     string `mapstructure:"addr"`
+	Password string `mapstructure:"password"`
+	DB       int    `mapstructure:"db"`
+}
+```
+
+- 新建 `pkg/database/redis.go`，参考原项目实现 `InitRedis`：
+```go
+package database
+
+import (
+	"context"
+	"github.com/go-redis/redis/v8"
+	"pai_smart_go_v2/pkg/log"
+)
+
+var RDB *redis.Client
+
+// InitRedis 初始化 Redis 客户端连接
+func InitRedis(addr, password string, db int) {
+	RDB = redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: password,
+		DB:       db,
+	})
+
+	ctx := context.Background()
+	if err := RDB.Ping(ctx).Err(); err != nil {
+		log.Fatal("failed to connect to redis", err)
+	}
+
+	log.Info("Redis client connected successfully")
+}
+```
+
+- 更新 `cmd/server/main.go`，在 `database.InitMySQL(...)` 后添加：
+```go
+database.InitRedis(cfg.Database.Redis.Addr, cfg.Database.Redis.Password, cfg.Database.Redis.DB)
+```
+
+##### 知识点
+
+**go-redis 库**
+
+`go-redis/redis/v8` 是 Go 社区最流行的 Redis 客户端库。核心用法：
+- `redis.NewClient(&redis.Options{...})` — 创建客户端实例
+- `RDB.Ping(ctx)` — 测试连接是否正常
+- `Password` 为空字符串时自动跳过认证，兼容无密码的 Redis
+
+**与 MySQL 初始化的设计对比**
+
+| | InitMySQL | InitRedis |
+| :--- | :--- | :--- |
+| 全局变量 | `DB *gorm.DB` | `RDB *redis.Client` |
+| 连接测试 | GORM 内部自动测试 | 手动 `Ping(ctx)` |
+| 连接池 | 需手动配置（MaxIdleConns 等） | go-redis 内置连接池，默认即可 |
+| 失败处理 | `log.Fatal` 退出 | `log.Fatal` 退出 |
+
+两者设计思路一致：启动时初始化 → 全局单例 → 失败即 Fatal → 后续业务通过 `database.DB` / `database.RDB` 访问。
+
