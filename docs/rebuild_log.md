@@ -934,47 +934,8 @@ database:
 ```
 
 - 更新 `internal/config/config.go`，在 `DatabaseConfig` 中添加 `RedisConfig`：
-```go
-type DatabaseConfig struct {
-	MySQL MySQLConfig `mapstructure:"mysql"`
-	Redis RedisConfig `mapstructure:"redis"`
-}
-
-type RedisConfig struct {
-	Addr     string `mapstructure:"addr"`
-	Password string `mapstructure:"password"`
-	DB       int    `mapstructure:"db"`
-}
-```
 
 - 新建 `pkg/database/redis.go`，参考原项目实现 `InitRedis`：
-```go
-package database
-
-import (
-	"context"
-	"github.com/go-redis/redis/v8"
-	"pai_smart_go_v2/pkg/log"
-)
-
-var RDB *redis.Client
-
-// InitRedis 初始化 Redis 客户端连接
-func InitRedis(addr, password string, db int) {
-	RDB = redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: password,
-		DB:       db,
-	})
-
-	ctx := context.Background()
-	if err := RDB.Ping(ctx).Err(); err != nil {
-		log.Fatal("failed to connect to redis", err)
-	}
-
-	log.Info("Redis client connected successfully")
-}
-```
 
 - 更新 `cmd/server/main.go`，在 `database.InitMySQL(...)` 后添加：
 ```go
@@ -1000,4 +961,12 @@ database.InitRedis(cfg.Database.Redis.Addr, cfg.Database.Redis.Password, cfg.Dat
 | 失败处理 | `log.Fatal` 退出 | `log.Fatal` 退出 |
 
 两者设计思路一致：启动时初始化 → 全局单例 → 失败即 Fatal → 后续业务通过 `database.DB` / `database.RDB` 访问。
+
+#### 2. 组织标签模型
+
+更新：创建 `internal/model/org_tag.go`
+
+核心目的是用树形结构来表示组织层级，从而实现多租户的文档权限隔离.
+- 文档的归属与访问控制 —— 每个文档（file_upload）关联一个 org_tag，搜索时根据用户所属的组织标签来过滤可见文档。
+- 组织的层级结构 —— 通过 ParentTag 实现树形组织架构（如：公司 → 部门 → 小组），子组织的成员可以向上继承父组织的文档访问权限。
 
