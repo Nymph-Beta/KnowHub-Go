@@ -60,6 +60,65 @@ func (f *fakeUserRepo) FindByID(userID uint) (*model.User, error) {
 	return nil, nil
 }
 
+type fakeOrgTagRepo struct {
+	createFn                    func(tag *model.OrganizationTag) error
+	findAllFn                   func() ([]model.OrganizationTag, error)
+	findByIDFn                  func(id string) (*model.OrganizationTag, error)
+	findByParentTagFn           func(parentTag *string) ([]model.OrganizationTag, error)
+	updateFn                    func(tag *model.OrganizationTag) error
+	deleteFn                    func(tagID string) error
+	deleteAndReparentChildrenFn func(tagID string) error
+}
+
+func (f *fakeOrgTagRepo) Create(tag *model.OrganizationTag) error {
+	if f.createFn != nil {
+		return f.createFn(tag)
+	}
+	return nil
+}
+
+func (f *fakeOrgTagRepo) FindAll() ([]model.OrganizationTag, error) {
+	if f.findAllFn != nil {
+		return f.findAllFn()
+	}
+	return []model.OrganizationTag{}, nil
+}
+
+func (f *fakeOrgTagRepo) FindByID(id string) (*model.OrganizationTag, error) {
+	if f.findByIDFn != nil {
+		return f.findByIDFn(id)
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (f *fakeOrgTagRepo) FindByParentTag(parentTag *string) ([]model.OrganizationTag, error) {
+	if f.findByParentTagFn != nil {
+		return f.findByParentTagFn(parentTag)
+	}
+	return []model.OrganizationTag{}, nil
+}
+
+func (f *fakeOrgTagRepo) Update(tag *model.OrganizationTag) error {
+	if f.updateFn != nil {
+		return f.updateFn(tag)
+	}
+	return nil
+}
+
+func (f *fakeOrgTagRepo) Delete(tagID string) error {
+	if f.deleteFn != nil {
+		return f.deleteFn(tagID)
+	}
+	return nil
+}
+
+func (f *fakeOrgTagRepo) DeleteAndReparentChildren(tagID string) error {
+	if f.deleteAndReparentChildrenFn != nil {
+		return f.deleteAndReparentChildrenFn(tagID)
+	}
+	return nil
+}
+
 func TestMain(m *testing.M) {
 	// service 里有 log.Errorf，初始化一下避免 nil panic
 	applog.Init("error", "console", "")
@@ -81,7 +140,7 @@ func TestUserService_Register_Success(t *testing.T) {
 			return nil
 		},
 	}
-	svc := NewUserService(repo, newJWT())
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, newJWT())
 
 	u, err := svc.Register("alice", "123456")
 	if err != nil {
@@ -101,7 +160,7 @@ func TestUserService_Register_UserAlreadyExists(t *testing.T) {
 			return &model.User{ID: 1, Username: "alice"}, nil
 		},
 	}
-	svc := NewUserService(repo, newJWT())
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, newJWT())
 
 	_, err := svc.Register("alice", "123456")
 	if !errors.Is(err, ErrUserAlreadyExists) {
@@ -122,7 +181,7 @@ func TestUserService_Login_Success(t *testing.T) {
 			}, nil
 		},
 	}
-	svc := NewUserService(repo, jm)
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, jm)
 
 	access, refresh, err := svc.Login("alice", "123456")
 	if err != nil {
@@ -146,7 +205,7 @@ func TestUserService_Login_UserNotFound(t *testing.T) {
 			return nil, gorm.ErrRecordNotFound
 		},
 	}
-	svc := NewUserService(repo, newJWT())
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, newJWT())
 
 	_, _, err := svc.Login("no-user", "123456")
 	if !errors.Is(err, ErrInvalidCredentials) {
@@ -166,7 +225,7 @@ func TestUserService_Login_WrongPassword(t *testing.T) {
 			}, nil
 		},
 	}
-	svc := NewUserService(repo, newJWT())
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, newJWT())
 
 	_, _, err := svc.Login("alice", "wrong-password")
 	if !errors.Is(err, ErrInvalidCredentials) {
@@ -180,7 +239,7 @@ func TestUserService_Login_DBError(t *testing.T) {
 			return nil, errors.New("connection refused")
 		},
 	}
-	svc := NewUserService(repo, newJWT())
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, newJWT())
 
 	_, _, err := svc.Login("alice", "123456")
 	if !errors.Is(err, ErrInternal) {
@@ -189,7 +248,7 @@ func TestUserService_Login_DBError(t *testing.T) {
 }
 
 func TestUserService_Login_NilJWTManager(t *testing.T) {
-	svc := NewUserService(&fakeUserRepo{}, nil)
+	svc := NewUserService(&fakeUserRepo{}, &fakeOrgTagRepo{}, nil)
 
 	_, _, err := svc.Login("alice", "123456")
 	if !errors.Is(err, ErrInternal) {
@@ -203,7 +262,7 @@ func TestUserService_Register_DBErrorOnFind(t *testing.T) {
 			return nil, errors.New("connection refused")
 		},
 	}
-	svc := NewUserService(repo, newJWT())
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, newJWT())
 
 	_, err := svc.Register("alice", "123456")
 	if err == nil {
@@ -220,7 +279,7 @@ func TestUserService_Register_CreateError(t *testing.T) {
 			return errors.New("duplicate key")
 		},
 	}
-	svc := NewUserService(repo, newJWT())
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, newJWT())
 
 	_, err := svc.Register("alice", "123456")
 	if err == nil {
@@ -238,7 +297,7 @@ func TestUserService_GetProfile_Success(t *testing.T) {
 			}, nil
 		},
 	}
-	svc := NewUserService(repo, newJWT())
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, newJWT())
 
 	u, err := svc.GetProfile("alice")
 	if err != nil {
@@ -255,7 +314,7 @@ func TestUserService_GetProfile_NotFound(t *testing.T) {
 			return nil, gorm.ErrRecordNotFound
 		},
 	}
-	svc := NewUserService(repo, newJWT())
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, newJWT())
 
 	_, err := svc.GetProfile("no-user")
 	if !errors.Is(err, ErrUserNotFound) {
@@ -269,7 +328,7 @@ func TestUserService_GetProfile_DBError(t *testing.T) {
 			return nil, errors.New("db down")
 		},
 	}
-	svc := NewUserService(repo, newJWT())
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, newJWT())
 
 	_, err := svc.GetProfile("alice")
 	if !errors.Is(err, ErrInternal) {

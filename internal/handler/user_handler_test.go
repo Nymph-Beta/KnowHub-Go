@@ -17,9 +17,13 @@ import (
 )
 
 type fakeUserService struct {
-	registerFn   func(username, password string) (*model.User, error)
-	loginFn      func(username, password string) (string, string, error)
-	getProfileFn func(username string) (*model.User, error)
+	registerFn             func(username, password string) (*model.User, error)
+	loginFn                func(username, password string) (string, string, error)
+	getProfileFn           func(username string) (*model.User, error)
+	logoutFn               func(token string) error
+	setUserPrimaryOrgFn    func(userID uint, orgTagID string) error
+	getUserOrgTagsFn       func(userID uint) ([]model.OrganizationTag, error)
+	getUserEffectiveTagsFn func(userID uint) ([]model.OrganizationTag, error)
 }
 
 func (f *fakeUserService) Register(username, password string) (*model.User, error) {
@@ -41,6 +45,34 @@ func (f *fakeUserService) GetProfile(username string) (*model.User, error) {
 		return f.getProfileFn(username)
 	}
 	return nil, nil
+}
+
+func (f *fakeUserService) Logout(token string) error {
+	if f.logoutFn != nil {
+		return f.logoutFn(token)
+	}
+	return nil
+}
+
+func (f *fakeUserService) SetUserPrimaryOrg(userID uint, orgTagID string) error {
+	if f.setUserPrimaryOrgFn != nil {
+		return f.setUserPrimaryOrgFn(userID, orgTagID)
+	}
+	return nil
+}
+
+func (f *fakeUserService) GetUserOrgTags(userID uint) ([]model.OrganizationTag, error) {
+	if f.getUserOrgTagsFn != nil {
+		return f.getUserOrgTagsFn(userID)
+	}
+	return []model.OrganizationTag{}, nil
+}
+
+func (f *fakeUserService) GetUserEffectiveOrgTags(userID uint) ([]model.OrganizationTag, error) {
+	if f.getUserEffectiveTagsFn != nil {
+		return f.getUserEffectiveTagsFn(userID)
+	}
+	return []model.OrganizationTag{}, nil
 }
 
 func TestMain(m *testing.M) {
