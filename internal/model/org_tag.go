@@ -8,7 +8,7 @@ type OrganizationTag struct {
 	TagID       string    `gorm:"type:varchar(255);primaryKey" json:"tag_id"`
 	Name        string    `gorm:"type:varchar(100);not null" json:"name"`
 	Description string    `gorm:"type:varchar(255);not null" json:"description"`
-	ParentTag   *string   `gorm:"type:varchar(255);not null" json:"parent_tag"`
+	ParentTag   *string   `gorm:"type:varchar(255);index" json:"parent_tag"`
 	CreatedBy   string    `gorm:"type:varchar(255);not null" json:"created_by"`
 	UpdatedBy   string    `gorm:"type:varchar(255);not null" json:"updated_by"`
 	CreatedAt   time.Time `gorm:"autoCreateTime" json:"created_at"`

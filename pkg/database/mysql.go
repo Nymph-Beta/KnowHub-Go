@@ -41,7 +41,7 @@ func RunMigrate() error {
 	if err := DB.AutoMigrate(
 		&model.User{},
 		// 后续阶段会继续添加：
-		// &model.OrgTag{},          // 阶段 5
+		&model.OrganizationTag{}, // 阶段 5
 		// &model.Upload{},          // 阶段 6-7
 		// &model.ChunkInfo{},       // 阶段 7
 		// &model.DocumentVector{},  // 阶段 10
