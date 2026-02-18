@@ -964,7 +964,34 @@ database.InitRedis(cfg.Database.Redis.Addr, cfg.Database.Redis.Password, cfg.Dat
 
 #### 2. 组织标签模型
 
-更新：创建 `internal/model/org_tag.go`
+更新：
+- 创建 `internal/model/org_tag.go` `internal/model/org_tag_repository.go`
+- 更新 `user.go` 添加标签字段
+- 更新  `user_service.go` 添加：
+  ```
+  ┌─────────────────────────────────────────────────────────┐
+  │  Service 层：UserService（同时注入两个 Repo）              │
+  │                                                          │
+  │  Register()               → orgTagRepo.Create (创建私人标签) │
+  │  SetUserPrimaryOrg()      → 读 User.OrgTags 校验归属       │
+  │  GetUserOrgTags()         → orgTagRepo.FindByID (查标签详情)│
+  │  GetUserEffectiveOrgTags()→ orgTagRepo.FindAll (BFS 遍历)  │
+  └─────────────────────────────────────────────────────────┘
+  ```
+- 更新 `user_handler.go` 添加：
+  ```
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Handler 层：UserHandler（注入 UserService）                   │
+  │                                                               │
+  │  Register()      → userService.Register        (注册，触发创建私人标签) │
+  │  GetProfile()    → 直接返回 context 中的 User   (含 OrgTags/PrimaryOrg) │
+  │  SetPrimaryOrg() → userService.SetUserPrimaryOrg(切换主组织)          │
+  │  GetUserOrgTags()→ userService.GetUserOrgTags   (查标签详情)          │
+  │                                                               │
+  │  ※ 纯翻译层：解析 HTTP 请求 → 委托 Service → 格式化响应              │
+  │  ※ ProfileResponse DTO 已定义(OrgTags []string)但未实际使用         │
+  └──────────────────────────────────────────────────────────────┘
+  ```
 
 核心目的是用树形结构来表示组织层级，从而实现多租户的文档权限隔离.
 - 文档的归属与访问控制 —— 每个文档（file_upload）关联一个 org_tag，搜索时根据用户所属的组织标签来过滤可见文档。
