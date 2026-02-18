@@ -50,6 +50,7 @@ func main() {
 
 	// 1. Repository
 	userRepo := repository.NewUserRepository(database.DB)
+	orgTagRepo := repository.NewOrganizationTagRepository(database.DB)
 
 	// 2. JWT Manager
 	jwtManager := token.NewJWTManager(
@@ -59,7 +60,7 @@ func main() {
 	)
 
 	// 3. Service (注入 Repository 和 JWTManager)
-	userService := service.NewUserService(userRepo, jwtManager)
+	userService := service.NewUserService(userRepo, orgTagRepo, jwtManager)
 
 	// 4. Handler (注入 Service)
 	userHandler := handler.NewUserHandler(userService)
@@ -79,6 +80,9 @@ func main() {
 		authed.Use(middleware.AuthMiddleware(jwtManager, userService))
 		{
 			authed.GET("/me", userHandler.GetProfile)
+			authed.POST("/logout", userHandler.Logout)
+			authed.PUT("/primary-org", userHandler.SetPrimaryOrg)
+			authed.GET("/org-tags", userHandler.GetUserOrgTags)
 		}
 	}
 
