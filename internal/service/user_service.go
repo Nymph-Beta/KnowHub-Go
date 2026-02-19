@@ -180,9 +180,14 @@ func (s *userService) Logout(token string) error {
 		return ErrUserNotFound
 	}
 	// 使用redis实现token黑名单，token剩余时间作为redis key的剩余时间
+	if database.RDB == nil {
+		return ErrInternal
+	}
 	redisKey := fmt.Sprintf("token_blacklist:%s", token)
 	redisValue := fmt.Sprintf("%s:%s", claims.Username, claims.Role)
-	database.RDB.Set(context.Background(), redisKey, redisValue, claims.ExpiresAt.Sub(time.Now()))
+	if err := database.RDB.Set(context.Background(), redisKey, redisValue, claims.ExpiresAt.Sub(time.Now())).Err(); err != nil {
+		return fmt.Errorf("failed to write token blacklist: %w", err)
+	}
 	return nil
 }
 

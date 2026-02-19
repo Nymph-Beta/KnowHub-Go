@@ -40,6 +40,7 @@ func main() {
 		log.Fatal("Failed to run migrations", err)
 		return
 	}
+	database.InitRedis(cfg.Database.Redis.Addr, cfg.Database.Redis.Password, cfg.Database.Redis.DB)
 	// TestLog()
 
 	// router := gin.Default()
