@@ -61,10 +61,12 @@ func main() {
 	)
 
 	// 3. Service (注入 Repository 和 JWTManager)
+	orgTagService := service.NewOrgTagService(orgTagRepo)
 	userService := service.NewUserService(userRepo, orgTagRepo, jwtManager)
 
 	// 4. Handler (注入 Service)
 	userHandler := handler.NewUserHandler(userService)
+	orgTagHandler := handler.NewOrgTagHandler(orgTagService)
 
 	// 4. 设置 Gin 模式
 	gin.SetMode(cfg.Server.Mode)
@@ -84,6 +86,25 @@ func main() {
 			authed.POST("/logout", userHandler.Logout)
 			authed.PUT("/primary-org", userHandler.SetPrimaryOrg)
 			authed.GET("/org-tags", userHandler.GetUserOrgTags)
+		}
+	}
+
+	// 管理员路由：先过认证，再做管理员鉴权
+	admin := r.Group("/api/v1/admin")
+	admin.Use(middleware.AuthMiddleware(jwtManager, userService), middleware.AdminAuthMiddleware())
+	{
+		// 用户管理（属于用户域，但只允许管理员访问）
+		admin.GET("/users", userHandler.ListUsers)
+		admin.PUT("/users/:userId/org-tags", userHandler.AssignOrgTagsToUser)
+
+		// 标签管理（独立标签域 Handler）
+		orgTags := admin.Group("/org-tags")
+		{
+			orgTags.POST("", orgTagHandler.Create)
+			orgTags.GET("", orgTagHandler.List)
+			orgTags.GET("/tree", orgTagHandler.GetTree)
+			orgTags.PUT("/:id", orgTagHandler.Update)
+			orgTags.DELETE("/:id", orgTagHandler.Delete)
 		}
 	}
 

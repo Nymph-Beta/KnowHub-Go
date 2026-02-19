@@ -20,10 +20,13 @@ type fakeUserService struct {
 	registerFn             func(username, password string) (*model.User, error)
 	loginFn                func(username, password string) (string, string, error)
 	getProfileFn           func(username string) (*model.User, error)
+	findByIDFn             func(userID uint) (*model.User, error)
 	logoutFn               func(token string) error
 	setUserPrimaryOrgFn    func(userID uint, orgTagID string) error
 	getUserOrgTagsFn       func(userID uint) ([]model.OrganizationTag, error)
 	getUserEffectiveTagsFn func(userID uint) ([]model.OrganizationTag, error)
+	listUsersFn            func(page, size int) ([]service.UserDetailDTO, int64, error)
+	assignOrgTagsFn        func(userID uint, orgTagIDs []string) error
 }
 
 func (f *fakeUserService) Register(username, password string) (*model.User, error) {
@@ -43,6 +46,13 @@ func (f *fakeUserService) Login(username, password string) (string, string, erro
 func (f *fakeUserService) GetProfile(username string) (*model.User, error) {
 	if f.getProfileFn != nil {
 		return f.getProfileFn(username)
+	}
+	return nil, nil
+}
+
+func (f *fakeUserService) FindByID(userID uint) (*model.User, error) {
+	if f.findByIDFn != nil {
+		return f.findByIDFn(userID)
 	}
 	return nil, nil
 }
@@ -73,6 +83,20 @@ func (f *fakeUserService) GetUserEffectiveOrgTags(userID uint) ([]model.Organiza
 		return f.getUserEffectiveTagsFn(userID)
 	}
 	return []model.OrganizationTag{}, nil
+}
+
+func (f *fakeUserService) ListUsers(page, size int) ([]service.UserDetailDTO, int64, error) {
+	if f.listUsersFn != nil {
+		return f.listUsersFn(page, size)
+	}
+	return []service.UserDetailDTO{}, 0, nil
+}
+
+func (f *fakeUserService) AssignOrgTagsToUser(userID uint, orgTagIDs []string) error {
+	if f.assignOrgTagsFn != nil {
+		return f.assignOrgTagsFn(userID, orgTagIDs)
+	}
+	return nil
 }
 
 func TestMain(m *testing.M) {

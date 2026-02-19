@@ -24,21 +24,53 @@ var (
 	ErrUserNotFound = errors.New("user not found")
 	// ErrUserAlreadyExists 用户已存在（注册时）
 	ErrUserAlreadyExists = errors.New("user already exists")
-	// ErrInternal 内部错误（对外不暴露细节）
-	ErrInternal       = errors.New("internal server error")
+	// ErrOrgTagNotFound 组织标签不存在
 	ErrOrgTagNotFound = errors.New("organization tag not found")
+	// ErrOrgTagNotOwned 用户未持有目标组织标签
 	ErrOrgTagNotOwned = errors.New("organization tag does not belong to user")
+	// ErrOrgTagAlreadyExists 创建标签时 TagID 重复
+	ErrOrgTagAlreadyExists = errors.New("organization tag already exists")
+	// ErrOrgTagHasChildren 删除标签时仍存在子节点
+	ErrOrgTagHasChildren = errors.New("organization tag has children")
+	// ErrInvalidInput 输入参数非法（空字符串、非法分页参数等）
+	ErrInvalidInput = errors.New("invalid input")
+	// ErrInternal 内部错误（对外不暴露细节）
+	ErrInternal = errors.New("internal server error")
 )
+
+// OrgTagDetailDTO 是管理员用户列表中组织标签的精简展示结构。
+// 只返回前端列表需要的字段，避免把完整标签模型（审计字段等）都暴露出去。
+type OrgTagDetailDTO struct {
+	TagID string `json:"tagId"`
+	Name  string `json:"name"`
+}
+
+// UserDetailDTO 是管理员用户列表中的单个用户展示结构。
+// 与 model.User 区别：
+// 1. OrgTags 从逗号分隔字符串转换为结构化数组，便于前端直接渲染。
+// 2. Status 保留兼容字段（0=ADMIN,1=USER），兼容旧前端逻辑。
+type UserDetailDTO struct {
+	UserID     uint              `json:"userId"`
+	Username   string            `json:"username"`
+	Role       string            `json:"role"`
+	OrgTags    []OrgTagDetailDTO `json:"orgTags"`
+	PrimaryOrg string            `json:"primaryOrg"`
+	Status     int               `json:"status"`
+	CreatedAt  time.Time         `json:"createdAt"`
+}
 
 type UserService interface {
 	Register(username, password string) (*model.User, error)
 	Login(username, password string) (accessToken, refreshToken string, err error)
 	GetProfile(username string) (*model.User, error)
+	FindByID(userID uint) (*model.User, error)
 
 	Logout(token string) error
 	SetUserPrimaryOrg(userID uint, orgTagID string) error
 	GetUserOrgTags(userID uint) ([]model.OrganizationTag, error)
 	GetUserEffectiveOrgTags(userID uint) ([]model.OrganizationTag, error)
+	ListUsers(page, size int) ([]UserDetailDTO, int64, error)
+	AssignOrgTagsToUser(userID uint, orgTagIDs []string) error
 }
 
 type userService struct {
@@ -164,6 +196,137 @@ func (s *userService) GetProfile(username string) (*model.User, error) {
 		return nil, ErrUserNotFound
 	}
 	return user, nil
+}
+
+// FindByID 根据用户 ID 获取用户。
+// 该方法给中间件和管理员接口复用，统一了用户不存在/数据库异常的错误语义。
+func (s *userService) FindByID(userID uint) (*model.User, error) {
+	if s.userRepo == nil {
+		return nil, ErrInternal
+	}
+
+	user, err := s.userRepo.FindByID(userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrUserNotFound
+		}
+		log.Errorf("FindByID: failed to query user %d: %v", userID, err)
+		return nil, ErrInternal
+	}
+	if user == nil {
+		return nil, ErrUserNotFound
+	}
+	return user, nil
+}
+
+// ListUsers 分页返回用户列表（管理员接口使用）。
+// 关键点：
+// 1. 输入 page/size 做兜底，避免出现负分页导致的不可预测行为。
+// 2. 一次性加载组织标签并建索引，避免对每个用户做 N+1 次标签查询。
+// 3. OrgTags 字段转为结构化数组，前端无需再解析逗号字符串。
+func (s *userService) ListUsers(page, size int) ([]UserDetailDTO, int64, error) {
+	if s.userRepo == nil || s.orgTagRepo == nil {
+		return nil, 0, ErrInternal
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if size <= 0 {
+		size = 10
+	}
+
+	offset := (page - 1) * size
+	users, total, err := s.userRepo.FindWithPagination(offset, size)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(users) == 0 {
+		return []UserDetailDTO{}, total, nil
+	}
+
+	allTags, err := s.orgTagRepo.FindAll()
+	if err != nil {
+		return nil, 0, err
+	}
+	tagByID := make(map[string]model.OrganizationTag, len(allTags))
+	for _, tag := range allTags {
+		tagByID[tag.TagID] = tag
+	}
+
+	result := make([]UserDetailDTO, 0, len(users))
+	for _, u := range users {
+		tagIDs := parseOrgTagIDs(u.OrgTags)
+		orgTagDetails := make([]OrgTagDetailDTO, 0, len(tagIDs))
+		for _, tagID := range tagIDs {
+			tag, ok := tagByID[tagID]
+			if !ok {
+				// 容错处理：用户历史脏数据中可能出现已删除标签。
+				// 这里选择跳过而不是让整个列表失败，保证管理端可用性。
+				continue
+			}
+			orgTagDetails = append(orgTagDetails, OrgTagDetailDTO{
+				TagID: tag.TagID,
+				Name:  tag.Name,
+			})
+		}
+
+		status := 1
+		if strings.EqualFold(u.Role, "ADMIN") {
+			status = 0
+		}
+
+		result = append(result, UserDetailDTO{
+			UserID:     u.ID,
+			Username:   u.Username,
+			Role:       u.Role,
+			OrgTags:    orgTagDetails,
+			PrimaryOrg: u.PrimaryOrg,
+			Status:     status,
+			CreatedAt:  u.CreatedAt,
+		})
+	}
+	return result, total, nil
+}
+
+// AssignOrgTagsToUser 为目标用户分配组织标签集合（管理员接口使用）。
+// 规则：
+// 1. 会去重和清理空白标签 ID。
+// 2. 所有标签必须真实存在，避免写入悬挂引用。
+// 3. 如果用户当前 PrimaryOrg 不在新集合中，自动切换为第一个标签（若有）。
+func (s *userService) AssignOrgTagsToUser(userID uint, orgTagIDs []string) error {
+	if s.userRepo == nil || s.orgTagRepo == nil {
+		return ErrInternal
+	}
+
+	user, err := s.FindByID(userID)
+	if err != nil {
+		return err
+	}
+
+	normalizedIDs := normalizeOrgTagIDs(orgTagIDs)
+	for _, tagID := range normalizedIDs {
+		if _, err := s.orgTagRepo.FindByID(tagID); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrOrgTagNotFound
+			}
+			return err
+		}
+	}
+
+	user.OrgTags = strings.Join(normalizedIDs, ",")
+	if len(normalizedIDs) == 0 {
+		user.PrimaryOrg = ""
+	} else if !containsString(normalizedIDs, user.PrimaryOrg) {
+		user.PrimaryOrg = normalizedIDs[0]
+	}
+
+	if err := s.userRepo.Update(user); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrUserNotFound
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *userService) Logout(token string) error {
@@ -357,4 +520,39 @@ func parseOrgTagIDs(raw string) []string {
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+// normalizeOrgTagIDs 对管理员提交的标签列表做标准化处理：
+// 1. trim 去空白
+// 2. 跳过空值
+// 3. 保持输入顺序去重
+func normalizeOrgTagIDs(rawIDs []string) []string {
+	if len(rawIDs) == 0 {
+		return []string{}
+	}
+
+	result := make([]string, 0, len(rawIDs))
+	seen := make(map[string]struct{}, len(rawIDs))
+	for _, rawID := range rawIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
+}
+
+// containsString 判断切片中是否包含目标值。
+func containsString(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }

@@ -335,3 +335,101 @@ func TestUserService_GetProfile_DBError(t *testing.T) {
 		t.Fatalf("expect ErrInternal, got %v", err)
 	}
 }
+
+func TestUserService_AssignOrgTagsToUser_Success(t *testing.T) {
+	updated := &model.User{}
+	repo := &fakeUserRepo{
+		findByIDFn: func(userID uint) (*model.User, error) {
+			return &model.User{
+				ID:         userID,
+				Username:   "alice",
+				Role:       "USER",
+				OrgTags:    "legacy",
+				PrimaryOrg: "legacy",
+			}, nil
+		},
+		updateFn: func(user *model.User) error {
+			*updated = *user
+			return nil
+		},
+	}
+	orgRepo := &fakeOrgTagRepo{
+		findByIDFn: func(id string) (*model.OrganizationTag, error) {
+			return &model.OrganizationTag{TagID: id, Name: id}, nil
+		},
+	}
+	svc := NewUserService(repo, orgRepo, newJWT())
+
+	err := svc.AssignOrgTagsToUser(7, []string{"team-a", " team-b ", "team-a"})
+	if err != nil {
+		t.Fatalf("AssignOrgTagsToUser() error = %v", err)
+	}
+	if updated.OrgTags != "team-a,team-b" {
+		t.Fatalf("unexpected OrgTags, got %q", updated.OrgTags)
+	}
+	if updated.PrimaryOrg != "team-a" {
+		t.Fatalf("unexpected PrimaryOrg, got %q", updated.PrimaryOrg)
+	}
+}
+
+func TestUserService_AssignOrgTagsToUser_TagNotFound(t *testing.T) {
+	repo := &fakeUserRepo{
+		findByIDFn: func(userID uint) (*model.User, error) {
+			return &model.User{ID: userID, Username: "alice"}, nil
+		},
+	}
+	orgRepo := &fakeOrgTagRepo{
+		findByIDFn: func(id string) (*model.OrganizationTag, error) {
+			return nil, gorm.ErrRecordNotFound
+		},
+	}
+	svc := NewUserService(repo, orgRepo, newJWT())
+
+	err := svc.AssignOrgTagsToUser(1, []string{"missing-tag"})
+	if !errors.Is(err, ErrOrgTagNotFound) {
+		t.Fatalf("expect ErrOrgTagNotFound, got %v", err)
+	}
+}
+
+func TestUserService_ListUsers_Success(t *testing.T) {
+	repo := &fakeUserRepo{
+		findWithPaginationFn: func(offset, limit int) ([]model.User, int64, error) {
+			return []model.User{
+				{
+					ID:         1,
+					Username:   "admin",
+					Role:       "ADMIN",
+					OrgTags:    "root,team-a",
+					PrimaryOrg: "root",
+					CreatedAt:  time.Unix(100, 0),
+				},
+			}, 1, nil
+		},
+	}
+	orgRepo := &fakeOrgTagRepo{
+		findAllFn: func() ([]model.OrganizationTag, error) {
+			return []model.OrganizationTag{
+				{TagID: "root", Name: "Root"},
+				{TagID: "team-a", Name: "Team A"},
+			}, nil
+		},
+	}
+	svc := NewUserService(repo, orgRepo, newJWT())
+
+	users, total, err := svc.ListUsers(1, 10)
+	if err != nil {
+		t.Fatalf("ListUsers() error = %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("expect total=1, got %d", total)
+	}
+	if len(users) != 1 {
+		t.Fatalf("expect 1 user, got %d", len(users))
+	}
+	if users[0].Status != 0 {
+		t.Fatalf("expect admin status=0, got %d", users[0].Status)
+	}
+	if len(users[0].OrgTags) != 2 {
+		t.Fatalf("expect 2 org tags, got %d", len(users[0].OrgTags))
+	}
+}
