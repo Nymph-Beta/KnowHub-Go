@@ -965,35 +965,225 @@ database.InitRedis(cfg.Database.Redis.Addr, cfg.Database.Redis.Password, cfg.Dat
 #### 2. 组织标签模型
 
 更新：
-- 创建 `internal/model/org_tag.go` `internal/model/org_tag_repository.go`
-- 更新 `user.go` 添加标签字段
-- 更新  `user_service.go` 添加：
-  ```
-  ┌─────────────────────────────────────────────────────────┐
-  │  Service 层：UserService（同时注入两个 Repo）              │
-  │                                                          │
-  │  Register()               → orgTagRepo.Create (创建私人标签) │
-  │  SetUserPrimaryOrg()      → 读 User.OrgTags 校验归属       │
-  │  GetUserOrgTags()         → orgTagRepo.FindByID (查标签详情)│
-  │  GetUserEffectiveOrgTags()→ orgTagRepo.FindAll (BFS 遍历)  │
-  └─────────────────────────────────────────────────────────┘
-  ```
-- 更新 `user_handler.go` 添加：
-  ```
-  ┌──────────────────────────────────────────────────────────────┐
-  │  Handler 层：UserHandler（注入 UserService）                   │
-  │                                                               │
-  │  Register()      → userService.Register        (注册，触发创建私人标签) │
-  │  GetProfile()    → 直接返回 context 中的 User   (含 OrgTags/PrimaryOrg) │
-  │  SetPrimaryOrg() → userService.SetUserPrimaryOrg(切换主组织)          │
-  │  GetUserOrgTags()→ userService.GetUserOrgTags   (查标签详情)          │
-  │                                                               │
-  │  ※ 纯翻译层：解析 HTTP 请求 → 委托 Service → 格式化响应              │
-  │  ※ ProfileResponse DTO 已定义(OrgTags []string)但未实际使用         │
-  └──────────────────────────────────────────────────────────────┘
-  ```
+- 新建 `internal/model/org_tag.go`
+  - 定义 `OrganizationTag`（映射 `organization_tags` 表）
+  - 定义 `OrganizationTagNode`（用于树形响应）
+  - `ParentTag *string` 建立索引，支持根节点 `NULL` 和树形查询
 
-核心目的是用树形结构来表示组织层级，从而实现多租户的文档权限隔离.
-- 文档的归属与访问控制 —— 每个文档（file_upload）关联一个 org_tag，搜索时根据用户所属的组织标签来过滤可见文档。
-- 组织的层级结构 —— 通过 ParentTag 实现树形组织架构（如：公司 → 部门 → 小组），子组织的成员可以向上继承父组织的文档访问权限。
+- 新建 `internal/repository/org_tag_repository.go`
+  - 提供 `Create/FindAll/FindByID/FindByParentTag/Update`
+  - `Delete`：保护删除（有子节点时返回 `ErrOrgTagHasChildren`）
+  - `DeleteAndReparentChildren`：重挂子节点后删除
+  - 删除相关逻辑使用事务保证原子性
 
+- 更新 `internal/model/user.go`
+  - 增加 `OrgTags string`（用户直连组织标签集合，逗号分隔）
+  - 增加 `PrimaryOrg string`（当前主组织）
+
+- 更新 `pkg/database/mysql.go`
+  - `AutoMigrate` 增加 `&model.OrganizationTag{}`
+
+- 更新 `internal/service/user_service.go`
+  - `UserService` 注入两个仓库：`userRepo + orgTagRepo`
+  - `Register()`：注册用户后自动创建私人标签 `user:<id>:private`，并回填 `OrgTags/PrimaryOrg`
+  - `SetUserPrimaryOrg()`：校验目标标签是否属于用户，且标签真实存在
+  - `GetUserOrgTags()`：按用户直连标签返回标签详情
+  - `GetUserEffectiveOrgTags()`：`FindAll + BFS` 计算有效标签集合
+  - 新增哨兵错误：`ErrOrgTagNotFound`、`ErrOrgTagNotOwned`
+  - 新增 `parseOrgTagIDs()` 统一处理空值、空白、去重
+
+- 更新 `internal/handler/user_handler.go`
+  - `ProfileResponse` 正式返回 `OrgTags []string` 与 `PrimaryOrg`
+  - 新增接口：`Logout()`、`SetPrimaryOrg()`、`GetUserOrgTags()`
+  - `mapServiceError()` 增加组织标签错误映射（404/403）
+  - Bearer Token 解析改为统一校验，避免无效 Header 导致歧义
+
+- 更新 `cmd/server/main.go`
+  - 注入 `orgTagRepo`
+  - 新增受保护路由：
+    - `POST /api/v1/users/logout`
+    - `PUT /api/v1/users/primary-org`
+    - `GET /api/v1/users/org-tags`
+
+核心目的：用树形组织标签表达“用户可见范围”，为后续文档上传、检索、权限过滤提供统一的组织语义基础。
+- 文档归属与访问控制：文档绑定 `org_tag`，查询时按用户有效标签过滤。
+- 组织层级表达：通过 `ParentTag` 表达“公司 → 部门 → 小组”，并可做子节点继承扩展。
+
+##### 设计思路与原理
+
+1. 为什么用“组织标签树”而不是把权限字段直接堆在用户表？
+   - 用户身份（`users`）和组织结构（`organization_tags`）是两类不同变化频率的数据。
+   - 组织结构会频繁调整（改名、重组、迁移父节点），独立建模后可以单独演进，不影响用户主数据结构。
+   - 标签树天然适配“继承可见范围”，比扁平角色字段更容易表达层级语义。
+
+2. 为什么用户里保留 `OrgTags`（直连标签）+ `PrimaryOrg`？
+   - `OrgTags` 表示“用户直接归属”的起点集合，是权限计算的输入，不直接等于最终可见范围。
+   - `PrimaryOrg` 用于前端展示与上下文选择（当前工作组织），降低每次请求都让前端传复杂上下文的成本。
+   - 这里先用逗号分隔字符串做轻量实现，后续可以平滑迁移到用户-标签关联表（多对多）以提升规范性与查询能力。
+
+3. 为什么 `GetUserEffectiveOrgTags()` 采用 `FindAll + BFS`？
+   - 权限判定本质是求“从用户直连标签出发的可达节点闭包”。
+   - BFS 能稳定处理任意层级深度，并通过 `visited` 去重，避免重复节点或环路造成死循环。
+   - 先全量拉取再内存遍历，能避免深层树结构下的大量 N+1 查询；在标签规模可控阶段是更稳妥的实现。
+
+4. 为什么注册时自动创建 `user:<id>:private` 私有标签？
+   - 新用户注册后立即具备最小可用组织上下文，避免出现“无组织可选、无法上传/检索”的冷启动问题。
+   - 私有标签作为默认隔离空间，天然支持“先私有，后共享”的权限演进路径。
+
+5. Service / Handler 分层原则
+   - Handler 只做协议翻译（HTTP 请求解析、状态码映射、响应格式化）。
+   - Service 负责领域规则（归属校验、有效范围计算、错误语义统一），避免业务逻辑散落在接口层。
+   - 这种分层使后续替换传输协议（HTTP -> gRPC）时，核心权限逻辑无需重写。
+
+6. 错误语义设计
+   - `ErrOrgTagNotFound`：资源不存在（404），用于真实标签缺失。
+   - `ErrOrgTagNotOwned`：资源存在但当前用户无归属（403），用于主组织切换等授权失败场景。
+   - 将“存在性”和“授权性”分离，有助于前端做更准确的交互提示，也便于日志与审计分析。
+
+### 3. AdminAuthMiddleware
+
+这一节对应一次“管理员能力重构”，重点不是单纯新增一个中间件，而是把原来 v1 的 `AdminService` 大杂烩架构拆分成清晰的领域分层，并把“是否管理员可访问”这个问题明确交给中间件处理。
+
+#### 重构动机
+
+在参考 v1 的实现后，发现三个结构性问题：
+
+1. **单一职责被破坏**  
+   `AdminService` 同时承担：
+   - 组织标签管理
+   - 用户管理
+   - 对话审计  
+   三个领域变化频率、演进方向完全不同，后续任何改动都容易互相影响。
+
+2. **业务逻辑重复**  
+   对话相关逻辑在 `AdminService` 中直接操作 `conversationRepo`，绕过已有 `ConversationService`，形成重复实现和维护分叉。
+
+3. **权限与业务耦合**  
+   “管理员接口”通过放在 `AdminService` 中来隐式表达权限，而不是由鉴权中间件明确控制，导致职责边界不清晰。
+
+---
+
+#### 重构目标
+
+1. **按业务域拆分服务，而不是按“是否管理员”拆分服务**
+2. **权限控制收敛到 Middleware**
+3. **Handler 只做 HTTP 翻译，Service 只做业务规则，Repository 只做持久化**
+4. **错误语义统一，避免字符串比较错误**
+
+---
+
+#### 重构思路
+
+##### 1) 服务层按领域拆分
+
+- 删除空壳 `internal/service/admin_service.go`
+- 新建 `internal/service/org_tag_service.go`，承接标签领域逻辑：
+  - `Create/Update/Delete/DeleteAndReparent/List/GetTree/FindByID`
+  - 统一转换底层错误到 service 哨兵错误
+- 在 `UserService` 中扩展管理员可调用的“用户域操作”：
+  - `ListUsers(page,size)`
+  - `AssignOrgTagsToUser(userID, orgTagIDs)`
+  - `FindByID(userID)`
+
+也就是说：**管理员能力是“权限维度”，不是“领域维度”**。  
+同一个 `UserService` 方法，普通路由不暴露，管理员路由暴露。
+
+##### 2) Handler 层解耦与复用
+
+- 新增 `internal/handler/helper.go`，抽出公共函数：
+  - `mapServiceError`
+  - `extractBearerToken`
+  - `getUserFromContext`
+  - `parseOrgTagIDsForResponse`
+- `UserHandler` 保留用户相关接口，并新增管理员用户管理接口：
+  - `ListUsers`
+  - `AssignOrgTagsToUser`
+- 新建 `OrgTagHandler` 专门负责标签管理接口：
+  - `Create/List/GetTree/Update/Delete`
+
+##### 3) 权限控制前置到中间件
+
+- `AuthMiddleware`：做“你是谁”
+- `AdminAuthMiddleware`：做“你是否是 ADMIN”
+
+路由层统一使用：
+
+```go
+admin := r.Group("/api/v1/admin")
+admin.Use(middleware.AuthMiddleware(jwtManager, userService), middleware.AdminAuthMiddleware())
+```
+
+这样接口是否可访问由中间件链决定，而不是散落在业务代码里手动判断。
+
+---
+
+#### 重构后架构
+
+##### 目录与职责
+
+```text
+internal/
+├── handler/
+│   ├── helper.go            # 公共HTTP工具：错误映射、token解析、上下文用户提取
+│   ├── user_handler.go      # 用户域HTTP接口 + 管理员用户管理接口
+│   └── org_tag_handler.go   # 组织标签管理HTTP接口（admin路由）
+├── service/
+│   ├── user_service.go      # 用户域业务逻辑（含管理员用户管理方法）
+│   └── org_tag_service.go   # 标签域业务逻辑
+├── repository/
+│   ├── user_repository.go
+│   └── org_tag_repository.go
+└── middleware/
+    ├── auth.go              # 认证
+    └── admin_auth.go        # 管理员鉴权
+```
+
+##### 依赖关系（重构后）
+
+```text
+Router
+ ├── /api/v1/users/**  -> UserHandler    -> UserService    -> UserRepository / OrgTagRepository
+ └── /api/v1/admin/**  -> UserHandler    -> UserService    -> UserRepository / OrgTagRepository
+                      \-> OrgTagHandler  -> OrgTagService  -> OrgTagRepository
+
+AuthMiddleware -> 注入 user
+AdminAuthMiddleware -> 校验 user.Role == "ADMIN"
+```
+
+##### 路由分工（核心）
+
+- 普通用户路由：
+  - `/api/v1/users/register`
+  - `/api/v1/users/login`
+  - `/api/v1/users/me`
+  - `/api/v1/users/logout`
+  - `/api/v1/users/primary-org`
+  - `/api/v1/users/org-tags`
+
+- 管理员路由：
+  - `/api/v1/admin/users`
+  - `/api/v1/admin/users/:userId/org-tags`
+  - `/api/v1/admin/org-tags`
+  - `/api/v1/admin/org-tags/tree`
+  - `/api/v1/admin/org-tags/:id`
+
+---
+
+#### 重构收益
+
+1. **职责清晰**：标签域和用户域分离，后续扩展不会互相污染。  
+2. **权限模型清晰**：访问控制集中在中间件，业务代码无需重复鉴权判断。  
+3. **可测试性提升**：`OrgTagService` / `UserService` 都可独立 mock 和单测。  
+4. **可维护性提升**：错误语义统一（哨兵错误 + 映射），接口返回行为稳定。  
+
+---
+
+#### 本节更新文件（对应本次重构）
+
+- `internal/service/org_tag_service.go`（新增）
+- `internal/service/user_service.go`（扩展管理员方法与错误语义）
+- `internal/handler/helper.go`（新增）
+- `internal/handler/org_tag_handler.go`（新增）
+- `internal/handler/user_handler.go`（扩展管理员接口）
+- `cmd/server/main.go`（新增 admin 路由与依赖注入）
+- `internal/service/admin_service.go`（删除）
