@@ -26,3 +26,10 @@ jwt:
   secret: "PXrQbuCwXwOZzkML/Vm2S5rSwt1iybvmKtGDzVEu+Hc="
   access_token_expire_hours: 24
   refresh_token_expire_days: 7
+
+minio:
+  endpoint: "127.0.0.1:9300"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  use_ssl: false
+  bucket: "uploads"

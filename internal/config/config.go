@@ -15,6 +15,7 @@ type Config struct {
 	Log      LogConfig      `mapstructure:"log"`
 	Database DatabaseConfig `mapstructure:"database"`
 	JWT      JWTConfig      `mapstructure:"jwt"`
+	MinIO    MinIOConfig    `mapstructure:"minio"`
 }
 
 // ServerConfig 存储服务器相关的配置。
@@ -54,6 +55,14 @@ type JWTConfig struct {
 	Secret                 string `mapstructure:"secret"`
 	AccessTokenExpireHours int    `mapstructure:"access_token_expire_hours"`
 	RefreshTokenExpireDays int    `mapstructure:"refresh_token_expire_days"`
+}
+
+type MinIOConfig struct {
+	Endpoint        string `mapstructure:"endpoint"`
+	AccessKeyID     string `mapstructure:"access_key_id"`
+	SecretAccessKey string `mapstructure:"secret_access_key"`
+	UseSSL          bool   `mapstructure:"use_ssl"`
+	BucketName      string `mapstructure:"bucket_name"`
 }
 
 // init 初始化配置加载，从指定的路径读取 YAML 配置文件并解析导入到 Conf 变量中
