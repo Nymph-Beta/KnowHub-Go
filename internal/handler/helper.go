@@ -32,6 +32,13 @@ func mapServiceError(err error) (httpStatus int, message string) {
 		return http.StatusConflict, "Organization tag already exists"
 	case errors.Is(err, service.ErrOrgTagHasChildren):
 		return http.StatusConflict, "Organization tag has child nodes"
+	// 文件上传相关错误
+	case errors.Is(err, service.ErrFileAlreadyExists):
+		return http.StatusConflict, "File already uploaded"
+	case errors.Is(err, service.ErrFileNotFound):
+		return http.StatusNotFound, "File not found"
+	case errors.Is(err, service.ErrUploadFailed):
+		return http.StatusInternalServerError, "File upload failed"
 	default:
 		return http.StatusInternalServerError, "Internal server error"
 	}

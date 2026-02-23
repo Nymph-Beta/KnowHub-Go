@@ -10,6 +10,7 @@ import (
 	"pai_smart_go_v2/internal/service"
 	"pai_smart_go_v2/pkg/database"
 	"pai_smart_go_v2/pkg/log"
+	"pai_smart_go_v2/pkg/storage"
 	"pai_smart_go_v2/pkg/token"
 
 	"net/http"
@@ -41,7 +42,9 @@ func main() {
 		return
 	}
 	database.InitRedis(cfg.Database.Redis.Addr, cfg.Database.Redis.Password, cfg.Database.Redis.DB)
-	// TestLog()
+
+	// 初始化 MinIO 对象存储客户端
+	storage.InitMinio(cfg.MinIO)
 
 	// router := gin.Default()
 	// router.GET("/ping", func(c *gin.Context) {
@@ -52,6 +55,7 @@ func main() {
 	// 1. Repository
 	userRepo := repository.NewUserRepository(database.DB)
 	orgTagRepo := repository.NewOrganizationTagRepository(database.DB)
+	uploadRepo := repository.NewUploadRepository(database.DB)
 
 	// 2. JWT Manager
 	jwtManager := token.NewJWTManager(
@@ -63,10 +67,12 @@ func main() {
 	// 3. Service (注入 Repository 和 JWTManager)
 	orgTagService := service.NewOrgTagService(orgTagRepo)
 	userService := service.NewUserService(userRepo, orgTagRepo, jwtManager)
+	uploadService := service.NewUploadService(uploadRepo, storage.MinIOClient, cfg.MinIO.BucketName)
 
 	// 4. Handler (注入 Service)
 	userHandler := handler.NewUserHandler(userService)
 	orgTagHandler := handler.NewOrgTagHandler(orgTagService)
+	uploadHandler := handler.NewUploadHandler(uploadService, cfg.MinIO.BucketName)
 
 	// 4. 设置 Gin 模式
 	gin.SetMode(cfg.Server.Mode)
@@ -87,6 +93,14 @@ func main() {
 			authed.PUT("/primary-org", userHandler.SetPrimaryOrg)
 			authed.GET("/org-tags", userHandler.GetUserOrgTags)
 		}
+	}
+
+	// 文件上传/下载路由（需要登录）
+	upload := r.Group("/api/v1")
+	upload.Use(middleware.AuthMiddleware(jwtManager, userService))
+	{
+		upload.POST("/upload/simple", uploadHandler.SimpleUpload)
+		upload.GET("/documents/download", uploadHandler.Download)
 	}
 
 	// 管理员路由：先过认证，再做管理员鉴权
