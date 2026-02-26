@@ -153,15 +153,17 @@ MD5 是基于文件内容计算的哈希，同样的内容一定得到同样的 
 请求文件
   │
   ▼
-┌──────────────────────────────────┐
-│ 1. io.TeeReader 边读边算 MD5     │  ← 一次遍历同时完成读取和哈希
-│ 2. FindByFileMD5AndUserID        │  ← 秒传检查
-│    ├─ 命中 → 返回已有记录（秒传） │
-│    └─ 未命中 → 继续               │
-│ 3. minioClient.PutObject         │  ← 上传到 MinIO
-│ 4. uploadRepo.Create             │  ← 写入 DB 记录
-│ 5. 返回 UploadResult             │
-└──────────────────────────────────┘
+┌──────────────────────────────────────┐
+│ 0a. 校验文件扩展名（白名单）          │  ← 拦截 RAG 管线不支持的格式
+│ 0b. OrgTag 为空 → 用 PrimaryOrg 回填 │  ← 确保权限过滤不遗漏
+│ 1. io.TeeReader 边读边算 MD5          │  ← 一次遍历同时完成读取和哈希
+│ 2. FindByFileMD5AndUserID             │  ← 秒传检查
+│    ├─ 命中 → 返回已有记录（秒传）     │
+│    └─ 未命中 → 继续                   │
+│ 3. minioClient.PutObject              │  ← 上传到 MinIO
+│ 4. uploadRepo.Create                  │  ← 写入 DB 记录
+│ 5. 返回 UploadResult                  │
+└──────────────────────────────────────┘
 ```
 
 #### 关键技术点
@@ -203,21 +205,56 @@ uploads/<userID>/<md5>/<原始文件名>
 
 | 错误 | 含义 | HTTP 映射 |
 | :--- | :--- | :--- |
+| `ErrUnsupportedFileType` | 文件类型不在 RAG 管线支持范围内 | 400 |
 | `ErrFileAlreadyExists` | 秒传场景（目前直接返回成功，未作为错误抛出） | 409 |
 | `ErrFileNotFound` | 下载时文件记录不存在 | 404 |
 | `ErrUploadFailed` | 上传到 MinIO 失败 | 500 |
 
-**5. 依赖注入设计**
+**5. 文件类型白名单**
+
+只接受 RAG 管线能处理的格式，上传时在读取文件内容之前就校验，提前拦截无效上传：
+
+```go
+var allowedExtensions = map[string]bool{
+    ".pdf": true, ".docx": true, ".doc": true,
+    ".txt": true, ".md": true, ".csv": true,
+    ".xlsx": true, ".xls": true, ".pptx": true,
+}
+```
+
+**6. 依赖注入设计**
 
 ```go
 type uploadService struct {
-    uploadRepo  repository.UploadRepository  // DB 操作
+    uploadRepo  repository.UploadRepository  // 文件元数据 DB 操作
+    userRepo    repository.UserRepository    // 用于 OrgTag 回填时查询用户信息
     minioClient *minio.Client                // 对象存储
     bucketName  string                       // 桶名
 }
 ```
 
 注入 `minioClient` 而非直接使用全局变量 `storage.MinIOClient`，与 `UserService` 注入 `userRepo` 的风格一致，便于单测时 mock。
+
+注入 `userRepo` 是为了支持 OrgTag 默认回填：上传时如果 `orgTag` 为空，自动用用户的 `PrimaryOrg` 填充，确保后续权限过滤不会遗漏。
+
+**7. DownloadFile 方法**
+
+下载逻辑也封装在 Service 中（而非 Handler 直接访问 MinIO 全局变量），返回 `DownloadResult`：
+
+```go
+type DownloadResult struct {
+    FileName    string        // 原始文件名（用于 Content-Disposition）
+    ContentType string        // MIME 类型
+    Size        int64         // 文件大小（用于 Content-Length）
+    Reader      io.ReadCloser // MinIO 对象流（调用方需 Close）
+}
+```
+
+这样 Handler 不需要导入 `pkg/storage` 或 `minio-go`，只做 HTTP 响应翻译，保持分层一致性。
+
+**8. 使用标准库 `bytes.NewReader`**
+
+上传到 MinIO 时，用标准库 `bytes.NewReader(fileBytes)` 包装已读取的字节切片，无需自定义 Reader 实现。`PutObject` 的参数类型是 `io.Reader`，不需要 `io.ReadCloser`，所以也不需要 `io.NopCloser` 包装。
 
 ---
 
@@ -255,7 +292,7 @@ multipart/form-data
 #### GET /api/v1/documents/download?fileMd5=xxx — 文件下载
 
 ```text
-流程：查 DB 记录 → 拼 objectKey → MinIO GetObject → 流式返回
+流程：调用 Service.DownloadFile() → 获取 DownloadResult → 设置响应头 → 流式返回
 
 响应头：
 Content-Disposition: attachment; filename="test.pdf"  ← 触发浏览器下载
@@ -263,10 +300,11 @@ Content-Type: application/octet-stream
 Content-Length: 1048576
 ```
 
-关键 API：
-- `storage.MinIOClient.GetObject()` — 返回 `*minio.Object`（实现了 `io.Reader`）
-- `object.Stat()` — 获取对象元信息（大小、ContentType）
-- `c.DataFromReader()` — Gin 的流式响应，不会把整个文件加载到内存
+Handler 只做 HTTP 翻译，所有 MinIO 交互封装在 Service 的 `DownloadFile` 方法中：
+- Service 内部：`FindByFileMD5AndUserID()` → 拼 objectKey → `minioClient.GetObject()` → `object.Stat()` → 返回 `DownloadResult`
+- Handler：从 `DownloadResult` 读取 `FileName`、`ContentType`、`Size`、`Reader` → `c.DataFromReader()` 流式响应
+
+Handler 不再直接导入 `pkg/storage` 或 `minio-go`，保持与 Upload 一致的 DI 模式。
 
 ---
 
@@ -274,12 +312,13 @@ Content-Length: 1048576
 
 更新：`internal/handler/helper.go`
 
-在 `mapServiceError` 中新增 3 条上传相关错误映射：
+在 `mapServiceError` 中新增 4 条上传相关错误映射：
 
 ```text
-ErrFileAlreadyExists → 409 Conflict
-ErrFileNotFound      → 404 Not Found
-ErrUploadFailed      → 500 Internal Server Error
+ErrUnsupportedFileType → 400 Bad Request
+ErrFileAlreadyExists   → 409 Conflict
+ErrFileNotFound        → 404 Not Found
+ErrUploadFailed        → 500 Internal Server Error
 ```
 
 保持统一的错误处理模式：Service 抛哨兵错误 → Handler 通过 `mapServiceError` 统一转换为 HTTP 状态码。
@@ -294,9 +333,11 @@ ErrUploadFailed      → 500 Internal Server Error
 ```text
 config → storage.InitMinio(cfg.MinIO)
        → uploadRepo := NewUploadRepository(database.DB)
-       → uploadService := NewUploadService(uploadRepo, storage.MinIOClient, cfg.MinIO.BucketName)
-       → uploadHandler := NewUploadHandler(uploadService, cfg.MinIO.BucketName)
+       → uploadService := NewUploadService(uploadRepo, userRepo, storage.MinIOClient, cfg.MinIO.BucketName)
+       → uploadHandler := NewUploadHandler(uploadService)
 ```
+
+注意：`NewUploadService` 额外注入了 `userRepo`（用于 OrgTag 回填），`NewUploadHandler` 不再需要 `bucketName`（MinIO 交互已完全封装在 Service 中）。
 
 路由注册：
 ```go
@@ -323,15 +364,18 @@ Router
                                     │
                               UploadService
                               ├── UploadRepository  → MySQL（文件元数据）
+                              ├── UserRepository    → MySQL（OrgTag 回填时查用户）
                               └── MinIOClient       → MinIO（文件本体）
 ```
 
 数据流向：
 
 ```text
-上传：客户端 → Handler(解析form) → Service(MD5+秒传+PutObject+写DB) → MinIO + MySQL
-下载：客户端 → Handler(解析参数) → Service(查DB) → Handler(GetObject+流式响应) → 客户端
+上传：客户端 → Handler(解析form) → Service(校验扩展名+OrgTag回填+MD5+秒传+PutObject+写DB) → MinIO + MySQL
+下载：客户端 → Handler(解析参数) → Service(查DB+GetObject) → Handler(设置响应头+流式返回) → 客户端
 ```
+
+Handler 不直接接触 MinIO，所有存储交互封装在 Service 内，保持分层一致性。
 
 ---
 
