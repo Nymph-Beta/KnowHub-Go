@@ -5,24 +5,20 @@ import (
 	"net/http"
 	"pai_smart_go_v2/internal/service"
 	"pai_smart_go_v2/pkg/log"
-	"pai_smart_go_v2/pkg/storage"
 
 	"github.com/gin-gonic/gin"
-	"github.com/minio/minio-go/v7"
 )
 
 // UploadHandler 负责文件上传/下载相关 HTTP 接口。
-// 路由需挂载 AuthMiddleware，确保请求已认证。
+// Handler 只做 HTTP 翻译，所有业务逻辑和存储交互封装在 UploadService 中。
 type UploadHandler struct {
 	uploadService service.UploadService
-	bucketName    string // MinIO 桶名，下载时需要用来获取对象
 }
 
 // NewUploadHandler 创建 UploadHandler 实例。
-func NewUploadHandler(uploadService service.UploadService, bucketName string) *UploadHandler {
+func NewUploadHandler(uploadService service.UploadService) *UploadHandler {
 	return &UploadHandler{
 		uploadService: uploadService,
-		bucketName:    bucketName,
 	}
 }
 
@@ -82,7 +78,7 @@ func (h *UploadHandler) SimpleUpload(c *gin.Context) {
 
 // Download 处理文件下载请求。
 // 路由：GET /api/v1/documents/download?fileMd5=xxx
-// 流程：查找 DB 记录 → 从 MinIO 获取对象流 → 设置响应头 → 流式返回文件内容
+// 流程：调用 Service 获取文件流 → 设置响应头 → 流式返回文件内容
 func (h *UploadHandler) Download(c *gin.Context) {
 	// 1. 获取查询参数
 	fileMD5 := c.Query("fileMd5")
@@ -101,8 +97,8 @@ func (h *UploadHandler) Download(c *gin.Context) {
 		return
 	}
 
-	// 3. 查找文件记录
-	upload, err := h.uploadService.GetFileForDownload(c.Request.Context(), fileMD5, user.ID)
+	// 3. 调用 Service 获取文件流（DB 查找 + MinIO GetObject 统一在 Service 内完成）
+	result, err := h.uploadService.DownloadFile(c.Request.Context(), fileMD5, user.ID)
 	if err != nil {
 		status, msg := mapServiceError(err)
 		c.JSON(status, gin.H{
@@ -112,46 +108,13 @@ func (h *UploadHandler) Download(c *gin.Context) {
 		})
 		return
 	}
+	defer result.Reader.Close()
 
-	// 4. 根据上传时的对象键格式，从 MinIO 获取文件流
-	objectKey := fmt.Sprintf("uploads/%d/%s/%s", upload.UserID, upload.FileMD5, upload.FileName)
+	// 4. 设置响应头，触发浏览器下载
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, result.FileName))
+	c.Header("Content-Type", result.ContentType)
+	c.Header("Content-Length", fmt.Sprintf("%d", result.Size))
 
-	object, err := storage.MinIOClient.GetObject(
-		c.Request.Context(),
-		h.bucketName,
-		objectKey,
-		minio.GetObjectOptions{},
-	)
-	if err != nil {
-		log.Errorf("从 MinIO 获取文件失败: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code":    http.StatusInternalServerError,
-			"error":   "Internal Server Error",
-			"message": "Failed to retrieve file",
-		})
-		return
-	}
-	defer object.Close()
-
-	// 5. 获取对象信息（用于设置 Content-Length）
-	objectInfo, err := object.Stat()
-	if err != nil {
-		log.Errorf("获取 MinIO 对象信息失败: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"code":    http.StatusInternalServerError,
-			"error":   "Internal Server Error",
-			"message": "Failed to retrieve file info",
-		})
-		return
-	}
-
-	// 6. 设置响应头，触发浏览器下载
-	// Content-Disposition: 告诉浏览器以附件形式下载，并指定文件名
-	// Content-Type: 使用对象存储中记录的 MIME 类型
-	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, upload.FileName))
-	c.Header("Content-Type", objectInfo.ContentType)
-	c.Header("Content-Length", fmt.Sprintf("%d", objectInfo.Size))
-
-	// 7. 流式写入响应体（不会把整个文件加载到内存）
-	c.DataFromReader(http.StatusOK, objectInfo.Size, objectInfo.ContentType, object, nil)
+	// 5. 流式写入响应体（不会把整个文件加载到内存）
+	c.DataFromReader(http.StatusOK, result.Size, result.ContentType, result.Reader, nil)
 }

@@ -33,6 +33,8 @@ func mapServiceError(err error) (httpStatus int, message string) {
 	case errors.Is(err, service.ErrOrgTagHasChildren):
 		return http.StatusConflict, "Organization tag has child nodes"
 	// 文件上传相关错误
+	case errors.Is(err, service.ErrUnsupportedFileType):
+		return http.StatusBadRequest, "Unsupported file type"
 	case errors.Is(err, service.ErrFileAlreadyExists):
 		return http.StatusConflict, "File already uploaded"
 	case errors.Is(err, service.ErrFileNotFound):

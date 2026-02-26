@@ -67,12 +67,12 @@ func main() {
 	// 3. Service (注入 Repository 和 JWTManager)
 	orgTagService := service.NewOrgTagService(orgTagRepo)
 	userService := service.NewUserService(userRepo, orgTagRepo, jwtManager)
-	uploadService := service.NewUploadService(uploadRepo, storage.MinIOClient, cfg.MinIO.BucketName)
+	uploadService := service.NewUploadService(uploadRepo, userRepo, storage.MinIOClient, cfg.MinIO.BucketName)
 
 	// 4. Handler (注入 Service)
 	userHandler := handler.NewUserHandler(userService)
 	orgTagHandler := handler.NewOrgTagHandler(orgTagService)
-	uploadHandler := handler.NewUploadHandler(uploadService, cfg.MinIO.BucketName)
+	uploadHandler := handler.NewUploadHandler(uploadService)
 
 	// 4. 设置 Gin 模式
 	gin.SetMode(cfg.Server.Mode)
