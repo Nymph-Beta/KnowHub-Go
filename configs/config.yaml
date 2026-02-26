@@ -29,7 +29,7 @@ jwt:
 
 minio:
   endpoint: "127.0.0.1:9300"
-  access_key: "minioadmin"
-  secret_key: "minioadmin"
+  access_key_id: "minioadmin"
+  secret_access_key: "minioadmin"
   use_ssl: false
-  bucket: "uploads"
+  bucket_name: "uploads"
