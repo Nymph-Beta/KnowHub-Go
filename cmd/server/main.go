@@ -55,7 +55,7 @@ func main() {
 	// 1. Repository
 	userRepo := repository.NewUserRepository(database.DB)
 	orgTagRepo := repository.NewOrganizationTagRepository(database.DB)
-	uploadRepo := repository.NewUploadRepository(database.DB)
+	uploadRepo := repository.NewUploadRepository(database.DB, database.RDB)
 
 	// 2. JWT Manager
 	jwtManager := token.NewJWTManager(
@@ -101,6 +101,10 @@ func main() {
 	{
 		upload.POST("/upload/simple", uploadHandler.SimpleUpload)
 		upload.GET("/documents/download", uploadHandler.Download)
+		// 阶段七：分片上传
+		upload.POST("/upload/check", uploadHandler.CheckFile)
+		upload.POST("/upload/chunk", uploadHandler.UploadChunk)
+		upload.POST("/upload/merge", uploadHandler.MergeChunks)
 	}
 
 	// 管理员路由：先过认证，再做管理员鉴权

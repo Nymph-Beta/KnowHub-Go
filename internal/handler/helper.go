@@ -41,6 +41,10 @@ func mapServiceError(err error) (httpStatus int, message string) {
 		return http.StatusNotFound, "File not found"
 	case errors.Is(err, service.ErrUploadFailed):
 		return http.StatusInternalServerError, "File upload failed"
+	case errors.Is(err, service.ErrChunksIncomplete):
+		return http.StatusBadRequest, "Not all chunks have been uploaded"
+	case errors.Is(err, service.ErrMergeFailed):
+		return http.StatusInternalServerError, "Failed to merge chunks"
 	default:
 		return http.StatusInternalServerError, "Internal server error"
 	}

@@ -3,6 +3,8 @@ package handler
 import (
 	"fmt"
 	"net/http"
+	"strconv"
+
 	"pai_smart_go_v2/internal/service"
 	"pai_smart_go_v2/pkg/log"
 
@@ -117,4 +119,168 @@ func (h *UploadHandler) Download(c *gin.Context) {
 
 	// 5. 流式写入响应体（不会把整个文件加载到内存）
 	c.DataFromReader(http.StatusOK, result.Size, result.ContentType, result.Reader, nil)
+}
+
+// ========== 阶段七：分片上传 ==========
+
+// CheckFile 检查文件是否已上传（秒传）或已上传了哪些分片（断点续传）。
+// 路由：POST /api/v1/upload/check
+// 请求体：JSON {"md5": "..."}
+func (h *UploadHandler) CheckFile(c *gin.Context) {
+	user, ok := getUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		MD5 string `json:"md5" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"error":   "Bad Request",
+			"message": "Field 'md5' is required",
+		})
+		return
+	}
+
+	result, err := h.uploadService.CheckFile(c.Request.Context(), req.MD5, user.ID)
+	if err != nil {
+		status, msg := mapServiceError(err)
+		c.JSON(status, gin.H{
+			"code":    status,
+			"error":   http.StatusText(status),
+			"message": msg,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    http.StatusOK,
+		"message": "OK",
+		"data":    result,
+	})
+}
+
+// UploadChunk 上传单个分片。
+// 路由：POST /api/v1/upload/chunk
+// 请求格式：multipart/form-data
+// 字段：fileMd5, fileName, totalSize, chunkIndex, orgTag, isPublic, file
+func (h *UploadHandler) UploadChunk(c *gin.Context) {
+	user, ok := getUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	fileMD5 := c.PostForm("fileMd5")
+	fileName := c.PostForm("fileName")
+	totalSizeStr := c.PostForm("totalSize")
+	chunkIndexStr := c.PostForm("chunkIndex")
+	orgTag := c.PostForm("orgTag")
+	isPublicStr := c.PostForm("isPublic")
+
+	if fileMD5 == "" || fileName == "" || totalSizeStr == "" || chunkIndexStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"error":   "Bad Request",
+			"message": "Fields fileMd5, fileName, totalSize, chunkIndex are required",
+		})
+		return
+	}
+
+	totalSize, err := strconv.ParseInt(totalSizeStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"error":   "Bad Request",
+			"message": "Invalid totalSize",
+		})
+		return
+	}
+
+	chunkIndex, err := strconv.Atoi(chunkIndexStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"error":   "Bad Request",
+			"message": "Invalid chunkIndex",
+		})
+		return
+	}
+
+	isPublic := isPublicStr == "true" || isPublicStr == "1"
+
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		log.Errorf("UploadChunk: 解析上传分片失败: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"error":   "Bad Request",
+			"message": "File is required (form field: 'file')",
+		})
+		return
+	}
+	defer file.Close()
+
+	result, err := h.uploadService.UploadChunk(
+		c.Request.Context(),
+		fileMD5, fileName, totalSize, chunkIndex,
+		file, header.Size,
+		user.ID, orgTag, isPublic,
+	)
+	if err != nil {
+		status, msg := mapServiceError(err)
+		c.JSON(status, gin.H{
+			"code":    status,
+			"error":   http.StatusText(status),
+			"message": msg,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    http.StatusOK,
+		"message": "Chunk uploaded",
+		"data":    result,
+	})
+}
+
+// MergeChunks 合并所有分片为最终文件。
+// 路由：POST /api/v1/upload/merge
+// 请求体：JSON {"fileMd5": "...", "fileName": "..."}
+func (h *UploadHandler) MergeChunks(c *gin.Context) {
+	user, ok := getUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		FileMD5  string `json:"fileMd5" binding:"required"`
+		FileName string `json:"fileName" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"error":   "Bad Request",
+			"message": "Fields fileMd5 and fileName are required",
+		})
+		return
+	}
+
+	result, err := h.uploadService.MergeChunks(c.Request.Context(), req.FileMD5, req.FileName, user.ID)
+	if err != nil {
+		status, msg := mapServiceError(err)
+		c.JSON(status, gin.H{
+			"code":    status,
+			"error":   http.StatusText(status),
+			"message": msg,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    http.StatusOK,
+		"message": "Merge successful",
+		"data":    result,
+	})
 }

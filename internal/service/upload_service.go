@@ -10,6 +10,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"pai_smart_go_v2/internal/model"
 	"pai_smart_go_v2/internal/repository"
@@ -19,16 +20,16 @@ import (
 	"gorm.io/gorm"
 )
 
+const DefaultChunkSize int64 = 5 * 1024 * 1024 // 5MB
+
 // 上传相关哨兵错误
 var (
-	// ErrFileAlreadyExists 文件已存在（同用户同MD5），用于秒传场景
-	ErrFileAlreadyExists = errors.New("file already uploaded")
-	// ErrFileNotFound 文件记录不存在
-	ErrFileNotFound = errors.New("file not found")
-	// ErrUploadFailed 上传到对象存储失败
-	ErrUploadFailed = errors.New("upload to storage failed")
-	// ErrUnsupportedFileType 文件类型不在 RAG 管线支持范围内
+	ErrFileAlreadyExists   = errors.New("file already uploaded")
+	ErrFileNotFound        = errors.New("file not found")
+	ErrUploadFailed        = errors.New("upload to storage failed")
 	ErrUnsupportedFileType = errors.New("unsupported file type")
+	ErrChunksIncomplete    = errors.New("not all chunks uploaded")
+	ErrMergeFailed         = errors.New("merge chunks failed")
 )
 
 // allowedExtensions RAG 系统支持处理的文件扩展名白名单
@@ -55,14 +56,41 @@ type DownloadResult struct {
 	Reader      io.ReadCloser
 }
 
+// CheckResult 文件检查结果，用于秒传和断点续传
+type CheckResult struct {
+	Completed      bool  `json:"completed"`
+	UploadedChunks []int `json:"uploadedChunks"`
+}
+
+// ChunkUploadResult 单个分片上传后返回的进度信息
+type ChunkUploadResult struct {
+	UploadedChunks []int   `json:"uploadedChunks"`
+	Progress       float64 `json:"progress"`
+}
+
+// MergeResult 分片合并后返回的文件信息
+type MergeResult struct {
+	ObjectURL string `json:"objectUrl"`
+	FileMD5   string `json:"fileMd5"`
+	FileName  string `json:"fileName"`
+}
+
 // UploadService 定义文件上传域的业务接口
 type UploadService interface {
-	// SimpleUpload 简单上传：计算MD5 → 秒传检查 → 上传MinIO → 写DB
+	// SimpleUpload 简单上传：计算MD5 → 秒传检查 → 上传MinIO → 写DB（阶段六）
 	SimpleUpload(ctx context.Context, userID uint, orgTag string, fileName string, fileSize int64, reader io.Reader) (*UploadResult, error)
 
 	// DownloadFile 根据 fileMD5 + userID 查找文件记录，并从 MinIO 获取文件流。
-	// 所有 MinIO 交互封装在 Service 内，保持 Handler 不直接接触存储层。
 	DownloadFile(ctx context.Context, fileMD5 string, userID uint) (*DownloadResult, error)
+
+	// CheckFile 检查文件上传状态：秒传判断 + 已上传分片列表（阶段七）
+	CheckFile(ctx context.Context, fileMD5 string, userID uint) (*CheckResult, error)
+
+	// UploadChunk 上传单个分片到 MinIO 并在 Redis bitmap 中标记
+	UploadChunk(ctx context.Context, fileMD5 string, fileName string, totalSize int64, chunkIndex int, reader io.Reader, chunkSize int64, userID uint, orgTag string, isPublic bool) (*ChunkUploadResult, error)
+
+	// MergeChunks 合并所有分片为最终文件，更新状态，异步清理临时数据
+	MergeChunks(ctx context.Context, fileMD5 string, fileName string, userID uint) (*MergeResult, error)
 }
 
 // uploadService 是 UploadService 接口的具体实现
@@ -226,5 +254,246 @@ func (s *uploadService) DownloadFile(ctx context.Context, fileMD5 string, userID
 		Size:        objectInfo.Size,
 		Reader:      object,
 	}, nil
+}
+
+// ========== 阶段七：分片上传 ==========
+
+func calcTotalChunks(totalSize int64) int {
+	return int((totalSize + DefaultChunkSize - 1) / DefaultChunkSize)
+}
+
+// CheckFile 检查文件上传状态：
+//  1. status=1 → 已完成（秒传命中）
+//  2. status=0 → 上传中，返回已上传分片列表（断点续传）
+//  3. 无记录 → 全新上传
+func (s *uploadService) CheckFile(ctx context.Context, fileMD5 string, userID uint) (*CheckResult, error) {
+	existing, err := s.uploadRepo.FindByFileMD5AndUserID(fileMD5, userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return &CheckResult{Completed: false, UploadedChunks: []int{}}, nil
+		}
+		log.Errorf("CheckFile: 查询文件记录失败: %v", err)
+		return nil, ErrInternal
+	}
+
+	if existing.Status == 1 {
+		return &CheckResult{Completed: true, UploadedChunks: []int{}}, nil
+	}
+
+	totalChunks := calcTotalChunks(existing.TotalSize)
+	uploadedChunks, err := s.uploadRepo.GetUploadedChunksFromRedis(ctx, fileMD5, userID, totalChunks)
+	if err != nil {
+		log.Errorf("CheckFile: 读取 Redis bitmap 失败: %v", err)
+		return nil, ErrInternal
+	}
+
+	return &CheckResult{Completed: false, UploadedChunks: uploadedChunks}, nil
+}
+
+// UploadChunk 上传单个分片：
+//  1. FindOrCreate FileUpload 记录
+//  2. 幂等检查（GETBIT）→ 已上传则跳过
+//  3. PutObject 到 chunks/{fileMD5}/{chunkIndex}
+//  4. 创建 ChunkInfo + SETBIT
+//  5. 返回当前进度
+func (s *uploadService) UploadChunk(
+	ctx context.Context,
+	fileMD5, fileName string,
+	totalSize int64,
+	chunkIndex int,
+	reader io.Reader,
+	chunkSize int64,
+	userID uint,
+	orgTag string,
+	isPublic bool,
+) (*ChunkUploadResult, error) {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	if !allowedExtensions[ext] {
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedFileType, ext)
+	}
+
+	if orgTag == "" {
+		user, err := s.userRepo.FindByID(userID)
+		if err != nil {
+			log.Errorf("UploadChunk: 查询用户信息失败: %v", err)
+			return nil, ErrInternal
+		}
+		orgTag = user.PrimaryOrg
+	}
+
+	totalChunks := calcTotalChunks(totalSize)
+
+	// FindOrCreate FileUpload
+	existing, err := s.uploadRepo.FindByFileMD5AndUserID(fileMD5, userID)
+	if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			log.Errorf("UploadChunk: 查询文件记录失败: %v", err)
+			return nil, ErrInternal
+		}
+		upload := &model.FileUpload{
+			FileMD5:   fileMD5,
+			FileName:  fileName,
+			TotalSize: totalSize,
+			Status:    0,
+			UserID:    userID,
+			OrgTag:    orgTag,
+			IsPublic:  isPublic,
+		}
+		if createErr := s.uploadRepo.Create(upload); createErr != nil {
+			log.Errorf("UploadChunk: 创建文件记录失败: %v", createErr)
+			return nil, ErrInternal
+		}
+	} else if existing.Status == 1 {
+		uploadedChunks := makeRange(totalChunks)
+		return &ChunkUploadResult{UploadedChunks: uploadedChunks, Progress: 100}, nil
+	}
+
+	// Idempotency: skip if already uploaded
+	alreadyUploaded, err := s.uploadRepo.IsChunkUploaded(ctx, fileMD5, userID, chunkIndex)
+	if err != nil {
+		log.Errorf("UploadChunk: 检查分片状态失败: %v", err)
+		return nil, ErrInternal
+	}
+	if alreadyUploaded {
+		log.Infof("UploadChunk: 分片已存在, md5=%s, index=%d", fileMD5, chunkIndex)
+		uploadedChunks, _ := s.uploadRepo.GetUploadedChunksFromRedis(ctx, fileMD5, userID, totalChunks)
+		return &ChunkUploadResult{
+			UploadedChunks: uploadedChunks,
+			Progress:       float64(len(uploadedChunks)) / float64(totalChunks) * 100,
+		}, nil
+	}
+
+	// Upload chunk to MinIO
+	chunkKey := fmt.Sprintf("chunks/%s/%d", fileMD5, chunkIndex)
+	_, err = s.minioClient.PutObject(ctx, s.bucketName, chunkKey, reader, chunkSize, minio.PutObjectOptions{
+		ContentType: "application/octet-stream",
+	})
+	if err != nil {
+		log.Errorf("UploadChunk: 上传分片到 MinIO 失败: %v", err)
+		return nil, fmt.Errorf("%w: %v", ErrUploadFailed, err)
+	}
+
+	// Create ChunkInfo DB record
+	chunkInfo := &model.ChunkInfo{
+		FileMD5:     fileMD5,
+		ChunkIndex:  chunkIndex,
+		StoragePath: chunkKey,
+	}
+	if err := s.uploadRepo.CreateChunkInfo(chunkInfo); err != nil {
+		log.Errorf("UploadChunk: 创建分片记录失败: %v", err)
+		return nil, ErrInternal
+	}
+
+	// Mark in Redis bitmap
+	if err := s.uploadRepo.MarkChunkUploaded(ctx, fileMD5, userID, chunkIndex); err != nil {
+		log.Errorf("UploadChunk: 标记分片失败: %v", err)
+		return nil, ErrInternal
+	}
+
+	uploadedChunks, _ := s.uploadRepo.GetUploadedChunksFromRedis(ctx, fileMD5, userID, totalChunks)
+	return &ChunkUploadResult{
+		UploadedChunks: uploadedChunks,
+		Progress:       float64(len(uploadedChunks)) / float64(totalChunks) * 100,
+	}, nil
+}
+
+// MergeChunks 合并所有分片为最终文件：
+//  1. 检查所有分片是否已上传
+//  2. 单分片 CopyObject / 多分片 ComposeObject
+//  3. 更新 DB 状态
+//  4. 异步清理 Redis + MinIO 临时分片
+func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName string, userID uint) (*MergeResult, error) {
+	upload, err := s.uploadRepo.FindByFileMD5AndUserID(fileMD5, userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrFileNotFound
+		}
+		log.Errorf("MergeChunks: 查询文件记录失败: %v", err)
+		return nil, ErrInternal
+	}
+
+	destKey := fmt.Sprintf("uploads/%d/%s/%s", userID, fileMD5, fileName)
+
+	if upload.Status == 1 {
+		return &MergeResult{ObjectURL: destKey, FileMD5: fileMD5, FileName: fileName}, nil
+	}
+
+	totalChunks := calcTotalChunks(upload.TotalSize)
+
+	uploadedChunks, err := s.uploadRepo.GetUploadedChunksFromRedis(ctx, fileMD5, userID, totalChunks)
+	if err != nil {
+		log.Errorf("MergeChunks: 获取上传分片列表失败: %v", err)
+		return nil, ErrInternal
+	}
+	if len(uploadedChunks) != totalChunks {
+		log.Errorf("MergeChunks: 分片未完整, uploaded=%d, total=%d", len(uploadedChunks), totalChunks)
+		return nil, ErrChunksIncomplete
+	}
+
+	// MinIO merge: single chunk uses CopyObject, multiple uses ComposeObject
+	dst := minio.CopyDestOptions{
+		Bucket: s.bucketName,
+		Object: destKey,
+	}
+
+	if totalChunks == 1 {
+		src := minio.CopySrcOptions{
+			Bucket: s.bucketName,
+			Object: fmt.Sprintf("chunks/%s/0", fileMD5),
+		}
+		_, err = s.minioClient.CopyObject(ctx, dst, src)
+	} else {
+		srcs := make([]minio.CopySrcOptions, totalChunks)
+		for i := 0; i < totalChunks; i++ {
+			srcs[i] = minio.CopySrcOptions{
+				Bucket: s.bucketName,
+				Object: fmt.Sprintf("chunks/%s/%d", fileMD5, i),
+			}
+		}
+		_, err = s.minioClient.ComposeObject(ctx, dst, srcs...)
+	}
+	if err != nil {
+		log.Errorf("MergeChunks: MinIO 合并失败: %v", err)
+		return nil, fmt.Errorf("%w: %v", ErrMergeFailed, err)
+	}
+
+	log.Infof("MergeChunks: 文件合并成功: %s", destKey)
+
+	now := time.Now()
+	if err := s.uploadRepo.UpdateFileUploadStatus(fileMD5, userID, 1, &now); err != nil {
+		log.Errorf("MergeChunks: 更新文件状态失败: %v", err)
+		return nil, ErrInternal
+	}
+
+	go s.cleanupAfterMerge(fileMD5, userID, totalChunks)
+
+	return &MergeResult{ObjectURL: destKey, FileMD5: fileMD5, FileName: fileName}, nil
+}
+
+// cleanupAfterMerge 异步删除 Redis bitmap 和 MinIO 临时分片对象
+func (s *uploadService) cleanupAfterMerge(fileMD5 string, userID uint, totalChunks int) {
+	ctx := context.Background()
+
+	if err := s.uploadRepo.DeleteUploadMark(ctx, fileMD5, userID); err != nil {
+		log.Errorf("cleanupAfterMerge: 删除 Redis bitmap 失败: %v", err)
+	}
+
+	for i := 0; i < totalChunks; i++ {
+		chunkKey := fmt.Sprintf("chunks/%s/%d", fileMD5, i)
+		if err := s.minioClient.RemoveObject(ctx, s.bucketName, chunkKey, minio.RemoveObjectOptions{}); err != nil {
+			log.Errorf("cleanupAfterMerge: 删除 MinIO 分片 %s 失败: %v", chunkKey, err)
+		}
+	}
+
+	log.Infof("cleanupAfterMerge: 清理完成, md5=%s, user=%d", fileMD5, userID)
+}
+
+// makeRange 生成 [0, n) 的整数切片
+func makeRange(n int) []int {
+	result := make([]int, n)
+	for i := 0; i < n; i++ {
+		result[i] = i
+	}
+	return result
 }
 
