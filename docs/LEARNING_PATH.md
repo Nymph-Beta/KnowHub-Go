@@ -799,6 +799,507 @@ wscat -c "ws://localhost:8081/chat/$TOKEN"
 
 ---
 
+## 阶段 15: RAG 质量评估体系搭建 📊
+**目标**: 先建立度量基准，才能驱动后续所有优化——没有评估就没有迭代
+
+### 背景
+当前项目没有任何 RAG 质量评估手段，所有改进都无法量化。主流生产级 RAG 系统依赖 RAGAS 四大指标（Context Recall、Context Precision、Faithfulness、Answer Relevancy）来衡量检索与生成质量。先搭好评估再做优化，才能确保每一步改动真的有效。
+
+### 实现任务
+
+- [ ] 构建评估数据集:
+  - 手动整理 30-50 组"问题 + 标准答案 + 期望命中的源文件"
+  - 存入 `testdata/eval_dataset.json`，格式:
+    ```json
+    [
+      {
+        "query": "什么是 RAG？",
+        "ground_truth": "RAG 是检索增强生成...",
+        "expected_sources": ["rag_intro.pdf"]
+      }
+    ]
+    ```
+
+- [ ] 实现检索层指标计算 `internal/eval/retrieval_metrics.go`:
+  - Precision@K: 返回的 K 个结果中有多少是相关的
+  - Recall@K: 相关文档中有多少被召回
+  - MRR（Mean Reciprocal Rank）: 第一个相关结果的排名倒数
+  - 对接现有 `SearchService.HybridSearch()`，跑评估数据集并输出指标
+
+- [ ] 实现生成层指标计算 `internal/eval/generation_metrics.go`:
+  - Faithfulness: 调用 LLM 判断回答中的每个声明是否能在检索结果中找到依据
+  - Answer Relevancy: 调用 LLM 判断回答是否切题回答了问题
+  - 输出结构化评估报告（JSON/CSV）
+
+- [ ] 创建评估入口 `cmd/eval/main.go`:
+  - 读取评估数据集，依次调用 SearchService 和 ChatService
+  - 输出各指标的平均值和逐条明细
+  - 支持 `go run cmd/eval/main.go --dataset testdata/eval_dataset.json`
+
+### 关键技术点
+- LLM-as-Judge 模式: 用 LLM 自身评判回答质量
+- 评估与业务代码解耦: eval 包只读取 service 层结果
+- 基线记录: 第一次跑出的指标就是"改造前基线"，后续每次优化都跑一次对比
+
+### 参考
+- [RAGAS 框架](https://docs.ragas.io/)
+- Precision@K / Recall@K / MRR 经典 IR 指标定义
+
+---
+
+## 阶段 16: 智能分块改造 🧩
+**目标**: 将固定窗口滑动切分升级为语义感知 + 结构感知的分块策略
+
+### 背景
+当前 `processor.go` 中 `splitText()` 按 1000 字符 + 100 重叠做纯机械切分，不区分文档类型，不感知段落/标题/表格边界。主流做法是语义分块（Semantic Chunking）和结构感知分块，可将检索准确率提升 15-30%。
+
+### 改造思路
+
+**第一步：结构感知分块（低成本高回报）**
+
+- [ ] 重构 `internal/pipeline/processor.go` 中的 `splitText()`，拆分为策略模式:
+  ```go
+  // internal/pipeline/chunker.go
+  type Chunker interface {
+      Chunk(text string, meta DocumentMeta) []TextChunk
+  }
+
+  type TextChunk struct {
+      Content  string
+      Index    int
+      Metadata map[string]string // title, section, page 等
+  }
+
+  type DocumentMeta struct {
+      FileName string
+      FileType string // pdf, docx, md, txt
+  }
+  ```
+
+- [ ] 实现 `MarkdownChunker`:
+  - 按 `#`/`##`/`###` 标题层级切分
+  - 每个 chunk 自动携带其所属的标题路径作为 metadata
+  - 超长章节再做二次切分（递归分割）
+
+- [ ] 实现 `GeneralChunker`（改进版固定窗口）:
+  - 优先在段落边界（`\n\n`）切分
+  - 其次在句号/换行处切分
+  - 最后才按字符数回退切分
+  - 保留重叠区域
+
+- [ ] 根据文件扩展名在 `Process()` 中自动选择 Chunker:
+  ```
+  .md  → MarkdownChunker
+  .txt → GeneralChunker（段落优先）
+  .pdf/.docx/.ppt → GeneralChunker（句子优先）
+  ```
+
+**第二步：语义分块（中成本高回报）**
+
+- [ ] 实现 `SemanticChunker`:
+  - 先按句子拆分文本
+  - 对相邻句子对计算 embedding 余弦相似度
+  - 在相似度突降处（低于阈值）切分为新 chunk
+  - 需调用现有的 `embedding.Client.CreateEmbedding()`
+
+- [ ] 性能优化:
+  - 批量 embedding 请求，减少 API 调用次数
+  - 在 `pkg/embedding/client.go` 中添加 `CreateBatchEmbedding()` 方法
+
+**第三步：元数据增强**
+
+- [ ] 扩展 ES 索引 mapping，新增 metadata 字段:
+  ```json
+  {
+    "section_title": {"type": "keyword"},
+    "page_number": {"type": "integer"},
+    "chunk_type": {"type": "keyword"}
+  }
+  ```
+
+- [ ] 修改 `model.EsDocument`，携带 metadata 入库
+- [ ] 检索时支持按 metadata 过滤（如只搜某个章节）
+
+### 验证方式
+- 跑阶段 15 的评估脚本，对比改造前后 Recall@10 和 Precision@10
+- 目标: Recall@10 提升 10% 以上
+
+---
+
+## 阶段 17: 查询增强与 Reranking 🔍
+**目标**: 在检索前做查询智能改写，在检索后加 Reranking 精排，双端提升检索质量
+
+### 背景
+当前 `search_service.go` 只做了停用词清洗（`normalizeQuery`），缺少语义层面的查询增强；检索后用 ES 自带 BM25 rescore，没有 Cross-Encoder 级别的精排。主流系统用 HyDE/Multi-Query 做查询扩展可提升召回率，用 Cross-Encoder 做重排可提升 10-40% 准确率。
+
+### 改造思路
+
+**第一步：查询改写层**
+
+- [ ] 新建 `internal/service/query_enhancer.go`:
+  ```go
+  type QueryEnhancer interface {
+      Enhance(ctx context.Context, originalQuery string) ([]string, error)
+  }
+  ```
+
+- [ ] 实现 HyDE（Hypothetical Document Embedding）:
+  - 调用 LLM 为用户问题生成一个"假设性答案片段"（100-200 字）
+  - 用假设答案的 embedding 替代原始问题的 embedding 去做向量检索
+  - Prompt 示例: `"请为以下问题写一个简短的知识库文档片段作为回答（不需要真实性，只需格式和风格像知识库内容）：{query}"`
+
+- [ ] 实现 Multi-Query 改写:
+  - 调用 LLM 将一个问题改写为 3 个不同角度的表述
+  - 分别检索后合并去重
+  - Prompt 示例: `"请将以下问题从3个不同角度重新表述，每行一个：{query}"`
+
+- [ ] 在 `SearchService.HybridSearch()` 的入口处插入 QueryEnhancer:
+  - 配置开关: `config.yaml` 中 `search.query_enhancement: "hyde" | "multi_query" | "none"`
+  - 默认关闭，可按需打开
+
+**第二步：Cross-Encoder Reranking**
+
+- [ ] 新建 `pkg/rerank/client.go`:
+  ```go
+  type Reranker interface {
+      Rerank(ctx context.Context, query string, documents []string, topN int) ([]RerankResult, error)
+  }
+
+  type RerankResult struct {
+      Index int
+      Score float64
+  }
+  ```
+
+- [ ] 实现方案（任选其一）:
+  - **方案 A — 调用外部 Rerank API**（推荐起步）:
+    - 对接 Cohere Rerank API 或智谱/阿里的重排序接口
+    - 简单 HTTP 调用，无需本地部署模型
+  - **方案 B — LLM-as-Reranker**:
+    - 用现有 DeepSeek API，Prompt 让它给每个候选结果打 1-10 分
+    - 成本较高但无需额外依赖
+  - **方案 C — 本地 Cross-Encoder**（进阶）:
+    - 部署 `bge-reranker-v2-m3` 到一个 Python microservice
+    - Go 通过 HTTP 调用
+
+- [ ] 在 `SearchService` 中集成 Reranker:
+  - 第一阶段: ES 返回 topK * 3 = 30 条候选
+  - 第二阶段: Reranker 精排，取 top 10 返回
+  - 配置开关: `search.reranking.enabled: true/false`
+
+**第三步：检索结果融合优化**
+
+- [ ] 将当前 ES rescore 替换为 RRF（Reciprocal Rank Fusion）:
+  - 分别拿到 knn 排名和 BM25 排名
+  - `RRF_score = 1/(k + rank_knn) + 1/(k + rank_bm25)`，k 常取 60
+  - 比硬编码权重更鲁棒，不依赖分数归一化
+
+### 验证方式
+- 跑阶段 15 评估脚本，对比各方案的 Precision@5、Recall@10、MRR
+- 目标: Precision@5 提升 15% 以上
+
+---
+
+## 阶段 18: 上下文管理升级 🧠
+**目标**: 从"硬截断 20 条消息"升级为 token 感知的动态上下文管理
+
+### 背景
+当前 `conversation_repository.go` 直接截断保留最近 20 条消息，`chat_service.go` 将 system + 全部历史 + 检索结果无差别拼接。没有 token 计数，可能超出模型上下文窗口，也可能浪费预算在无关历史上。主流做法是 token 预算分配 + 历史压缩 + 检索结果排序优化。
+
+### 改造思路
+
+**第一步：Token 计数与预算分配**
+
+- [ ] 新建 `pkg/tokenizer/counter.go`:
+  - 实现中英文混合文本的 token 估算（简易版: 中文 1 字 ≈ 1.5 token，英文按空格分词）
+  - 或对接 tiktoken 的 Go 移植版（如 `github.com/pkoukk/tiktoken-go`）
+  ```go
+  type TokenCounter interface {
+      Count(text string) int
+  }
+  ```
+
+- [ ] 在 `chat_service.go` 的 `composeMessages()` 中实现预算分配:
+  ```
+  总预算 = model_max_tokens（如 deepseek-chat = 64K）
+  - 预留生成空间 = max_tokens 配置（如 2000）
+  - system prompt 预算 = 实际占用
+  - 检索结果预算 = 总预算 * 40%
+  - 历史预算 = 剩余空间
+  ```
+  - 按预算从后往前填充历史（最近的优先）
+  - 检索结果按相关性排序后，从高到低填充直到预算耗尽
+
+**第二步：历史消息压缩**
+
+- [ ] 新建 `internal/service/context_compressor.go`:
+  ```go
+  type ContextCompressor interface {
+      Compress(ctx context.Context, messages []model.ChatMessage, tokenBudget int) ([]model.ChatMessage, error)
+  }
+  ```
+
+- [ ] 实现分层压缩策略:
+  - 最近 2-4 轮对话: 保留原文
+  - 更早的历史: 调用 LLM 生成摘要替代原文
+  - 摘要 Prompt: `"请将以下多轮对话压缩为一段简短的上下文摘要，保留关键信息：{messages}"`
+  - 缓存摘要到 Redis，避免重复压缩
+
+**第三步：检索结果排序优化（anti "Lost in the Middle"）**
+
+- [ ] 修改 `buildContextText()`:
+  - 将检索结果按相关性排序后，交替放置（最高 → 最低 → 次高 → 次低 ...）
+  - 确保最相关的内容出现在上下文的开头和末尾
+  - 这是应对 LLM "Lost in the Middle" 问题的简单有效策略
+
+**第四步：多会话支持**
+
+- [ ] 改造 `ConversationRepository`:
+  - 当前每个用户只有一个 `current_conversation`，新建对话会覆盖旧的
+  - 改为支持多会话: `user:{uid}:conversations` 存储会话列表
+  - 新增 API: 创建会话、切换会话、列出历史会话
+  - 前端聊天页面增加会话列表侧栏
+
+### 验证方式
+- 构造超长对话场景（30+ 轮），对比改造前后的回答质量
+- 用 token 计数验证消息不超出模型上下文窗口
+- 跑阶段 15 评估脚本，对比 Faithfulness 指标
+
+---
+
+## 阶段 19: 多模态与高级文档处理 📸
+**目标**: 支持图片/表格内容提取、聊天发图识图、扩展文档类型
+
+### 背景
+当前只支持文本类文档（pdf/doc/xls/ppt/txt/md），Tika 提取的是纯文本，丢失了表格结构和图片内容。聊天也只支持发送纯文本。主流 RAG 系统已支持图片 OCR 入库、对话中发图让模型识图、表格结构化提取等多模态能力。
+
+### 改造思路
+
+**第一步：增强文档处理——表格与图片提取**
+
+- [ ] 扩展 `pkg/tika/client.go`:
+  - 除提取纯文本外，额外调用 Tika 的 `/rmeta` 端点获取结构化元数据
+  - 解析 Tika 返回的 XHTML 格式，识别 `<table>` 和 `<img>` 标签
+  - 表格转为 Markdown 表格格式后入 chunk
+  - 图片引用记录到 metadata
+
+- [ ] 对 PDF 中的图片做 OCR:
+  - 方案 A: 使用 Tika 内置 Tesseract OCR（需要在 Docker 镜像中安装 Tesseract）
+  - 方案 B: 调用视觉模型 API（如 GPT-4o / Qwen-VL）描述图片内容后入 chunk
+  - 在 `pipeline/processor.go` 的 `Process()` 中增加图片处理分支
+
+- [ ] 扩展支持的文件类型:
+  - 在 `upload_service.go` 的 `typeMapping` 中增加: `.png`, `.jpg`, `.jpeg`, `.csv`, `.html`
+  - 图片文件: 直接调用视觉模型生成描述 → 描述文本作为 chunk 索引
+  - CSV 文件: 按行/按固定行数分块，保留表头
+
+**第二步：聊天发图识图（多模态对话）**
+
+- [ ] 升级 LLM Message 结构以支持多模态:
+  ```go
+  // pkg/llm/client.go
+  type MessageContent struct {
+      Type     string `json:"type"`      // "text" 或 "image_url"
+      Text     string `json:"text,omitempty"`
+      ImageURL *struct {
+          URL string `json:"url"`
+      } `json:"image_url,omitempty"`
+  }
+
+  type MultimodalMessage struct {
+      Role    string           `json:"role"`
+      Content []MessageContent `json:"content"`
+  }
+  ```
+
+- [ ] 后端改造:
+  - WebSocket 消息协议扩展: 支持发送 `{"type":"image","data":"base64..."}` 或图片 URL
+  - 收到图片后上传到 MinIO，生成临时访问 URL
+  - 构建多模态 Message 发给支持视觉的 LLM（需切换到支持视觉的模型如 deepseek-vl 或 qwen-vl）
+
+- [ ] 前端改造:
+  - 聊天输入框增加图片上传按钮/粘贴板图片支持
+  - 消息列表支持渲染图片消息
+  - 发送时将图片转为 base64 或先上传获取 URL
+
+- [ ] 配置:
+  ```yaml
+  # configs/config.yaml
+  llm:
+    vision:
+      enabled: true
+      model: "qwen-vl-plus"  # 或其他视觉模型
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  ```
+
+### 验证方式
+- 上传含表格/图片的 PDF，验证表格内容和图片描述能被检索到
+- 在聊天中发送一张截图，验证模型能正确描述图片内容
+- 跑阶段 15 评估脚本（增加含表格/图片的评估用例）
+
+---
+
+## 阶段 20: Agent 化与高级能力 🤖
+**目标**: 从 RAG 问答升级为具备工具调用、任务分解、联网检索能力的 Agent 系统
+
+### 背景
+当前系统是经典的"检索→生成"单链路 RAG，用户问什么就搜什么答什么。主流 Agent 系统具备意图识别、多步推理、工具调用（计算器/代码执行/联网搜索）、任务分解等能力，能处理复杂的多步骤问题。
+
+### 改造思路
+
+**第一步：Function Calling / Tool Use 框架**
+
+- [ ] 新建 `internal/agent/` 包:
+  ```go
+  // internal/agent/tool.go
+  type Tool struct {
+      Name        string
+      Description string
+      Parameters  json.RawMessage // JSON Schema
+      Execute     func(ctx context.Context, args map[string]interface{}) (string, error)
+  }
+
+  // internal/agent/executor.go
+  type AgentExecutor struct {
+      llmClient    llm.Client
+      tools        []Tool
+      maxIterations int
+  }
+  ```
+
+- [ ] 实现 ReAct 循环（Reasoning + Acting）:
+  - LLM 输出 "Thought → Action → Observation" 循环
+  - 解析 LLM 返回中的工具调用请求
+  - 执行工具 → 将结果反馈给 LLM → 继续推理
+  - 设置最大迭代次数防止无限循环
+
+- [ ] 内置工具集:
+  - `knowledge_search`: 调用现有 `SearchService.HybridSearch()`（当前 RAG 检索能力变成一个工具）
+  - `calculator`: 简单数学计算
+  - `current_time`: 返回当前时间
+  - `web_search`: 联网搜索（对接 SerpAPI/Tavily/Bing Search API）
+
+**第二步：联网深度搜索（DeepSearch）**
+
+- [ ] 新建 `pkg/websearch/client.go`:
+  ```go
+  type WebSearchClient interface {
+      Search(ctx context.Context, query string, maxResults int) ([]WebSearchResult, error)
+  }
+
+  type WebSearchResult struct {
+      Title   string
+      URL     string
+      Snippet string
+  }
+  ```
+
+- [ ] 实现搜索 + 内容抓取 + 摘要链路:
+  - 调用搜索 API 获取 top 5 结果
+  - 对每个 URL 抓取正文内容（可用 `go-readability` 提取正文）
+  - 将网页内容作为额外上下文喂给 LLM
+
+- [ ] 在 Agent 中注册为 `web_search` 工具:
+  - 当知识库检索无结果时，Agent 自动判断是否需要联网搜索
+  - 用户也可以显式请求"帮我搜索一下..."
+
+**第三步：意图识别与路由**
+
+- [ ] 新建 `internal/service/intent_router.go`:
+  - 用 LLM 做意图分类: 知识问答 / 闲聊 / 联网搜索 / 工具使用
+  - 不同意图走不同处理链路:
+    ```
+    知识问答 → RAG 链路（现有流程）
+    闲聊     → 直接 LLM 对话（不检索）
+    联网搜索 → web_search 工具
+    复杂问题 → Agent ReAct 循环
+    ```
+
+- [ ] 在 `ChatHandler` 中集成路由:
+  - 替换当前直接调用 `chatService.StreamResponse()` 的逻辑
+  - 改为先经过 IntentRouter 判断，再分发到对应处理器
+
+### 验证方式
+- 测试闲聊场景不触发检索（节省资源）
+- 测试知识库无法回答的问题，Agent 自动联网搜索并整合答案
+- 测试多步问题（如"帮我查一下 XX 的最新进展，然后和知识库中的 YY 对比"）
+
+---
+
+### 阶段 15-20 改造路线总览
+
+```
+阶段15: 评估体系      ← 一切改进的基础，先能量化才能优化
+  ↓
+阶段16: 智能分块      ← 数据质量是 RAG 的根基
+  ↓
+阶段17: 查询增强+重排  ← 检索质量是 RAG 的天花板
+  ↓
+阶段18: 上下文管理    ← 用好检索结果，防止超窗口/信息丢失
+  ↓
+阶段19: 多模态        ← 扩展能力边界（图片/表格）
+  ↓
+阶段20: Agent 化      ← 从 RAG 进化为智能体
+```
+
+**核心原则**: 每个阶段改完后，都跑一次阶段 15 的评估脚本，用数据证明改进有效。
+
+---
+
+## 学习建议 💡
+
+### 1. **每个阶段独立完成**
+- 不要跨阶段，确保当前阶段可运行
+- 每个阶段都写测试验证
+
+### 2. **对照原项目代码**
+- 先自己实现，遇到困难时参考原代码
+- 理解为什么这样设计
+
+### 3. **记录学习笔记**
+- 每个阶段的关键技术点
+- 遇到的问题和解决方案
+
+### 4. **循序渐进**
+- 从简单到复杂
+- 从单体到分布式
+- 从同步到异步
+
+### 5. **动手实践**
+- 不要只看代码，一定要自己写
+- 修改参数，观察效果
+- 故意制造错误，学习调试
+
+---
+
+## 参考资料 📚
+
+- **Go 语言**:
+  - [Go by Example](https://gobyexample.com/)
+  - [Effective Go](https://go.dev/doc/effective_go)
+
+- **Gin 框架**: https://gin-gonic.com/docs/
+- **GORM**: https://gorm.io/docs/
+- **Elasticsearch Go**: https://github.com/elastic/go-elasticsearch
+- **Kafka Go**: https://github.com/IBM/sarama
+- **MinIO Go**: https://min.io/docs/minio/linux/developers/go/minio-go.html
+
+- **原项目文档**:
+  - `/home/yyy/Projects/paismart-go/CLAUDE.md`
+  - `/home/yyy/Projects/paismart-go/README.md`
+
+- **RAG项目成熟实现**
+  参考资料：
+  - RAGAS metrics: https://docs.ragas.io/en/stable/concepts/metrics/
+  - Elasticsearch RRF: https://www.elastic.co/docs/reference/elasticsearch/rest-apis/reciprocal-rank-fusion
+  -Lost in the Middle (TACL 2024): https://aclanthology.org/2024.tacl-1.9/
+  - OpenAI tool/function calling: https://developers.openai.com/api/docs/guides/function-calling
+  - OWASP LLM Top 10 v1.1: https://owasp.org/www-project-top-10-for-large-language-model-applications/
+  - Anthropic Contextual Retrieval: https://www.anthropic.com/engineering/contextual-retrieval
+  - Microsoft GraphRAG: https://microsoft.github.io/graphrag/
+
+---
+
 ## 进度追踪 ✅
 
 | 阶段 | 状态 | 完成日期 | 备注 |
@@ -817,6 +1318,12 @@ wscat -c "ws://localhost:8081/chat/$TOKEN"
 | 12. WebSocket 对话 |  |  |  |
 | 13. 完善功能 |  |  |  |
 | 14. 优化部署 |  |  |  |
+| 15. RAG 评估体系 |  |  |  |
+| 16. 智能分块改造 |  |  |  |
+| 17. 查询增强+Reranking |  |  |  |
+| 18. 上下文管理升级 |  |  |  |
+| 19. 多模态文档处理 |  |  |  |
+| 20. Agent 化 |  |  |  |
 
 ---
 
@@ -825,3 +1332,5 @@ wscat -c "ws://localhost:8081/chat/$TOKEN"
 准备好了吗？让我们从**阶段 1: 项目初始化**开始！
 
 告诉我你准备好了，我会帮你一步步完成第一个阶段的代码编写。
+
+
