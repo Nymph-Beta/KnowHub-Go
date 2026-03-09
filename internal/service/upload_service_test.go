@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"pai_smart_go_v2/pkg/tasks"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +101,21 @@ type fakeUploadUserRepo struct {
 	findByIDFn func(userID uint) (*model.User, error)
 }
 
+type fakeTaskProducer struct {
+	produceFn func(ctx context.Context, task tasks.FileProcessingTask) error
+	called    int
+	lastTask  tasks.FileProcessingTask
+}
+
+func (f *fakeTaskProducer) ProduceFileTask(ctx context.Context, task tasks.FileProcessingTask) error {
+	f.called++
+	f.lastTask = task
+	if f.produceFn != nil {
+		return f.produceFn(ctx, task)
+	}
+	return nil
+}
+
 func (f *fakeUploadUserRepo) Create(user *model.User) error { return nil }
 func (f *fakeUploadUserRepo) FindByUsername(username string) (*model.User, error) {
 	return nil, gorm.ErrRecordNotFound
@@ -154,7 +170,7 @@ func TestUploadService_CheckFile_NotFound(t *testing.T) {
 			return nil, gorm.ErrRecordNotFound
 		},
 	}
-	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	result, err := svc.CheckFile(context.Background(), "md5-x", 7)
 	if err != nil {
@@ -171,7 +187,7 @@ func TestUploadService_CheckFile_Completed(t *testing.T) {
 			return &model.FileUpload{FileMD5: fileMD5, UserID: userID, Status: 1}, nil
 		},
 	}
-	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	result, err := svc.CheckFile(context.Background(), "md5-y", 8)
 	if err != nil {
@@ -198,7 +214,7 @@ func TestUploadService_CheckFile_InProgress(t *testing.T) {
 			return []int{0, 2}, nil
 		},
 	}
-	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	result, err := svc.CheckFile(context.Background(), "md5-z", 9)
 	if err != nil {
@@ -216,7 +232,7 @@ func TestUploadService_CheckFile_InProgress(t *testing.T) {
 }
 
 func TestUploadService_UploadChunk_UnsupportedFileType(t *testing.T) {
-	svc := NewUploadService(&fakeUploadRepo{}, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(&fakeUploadRepo{}, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	_, err := svc.UploadChunk(
 		context.Background(),
@@ -241,7 +257,7 @@ func TestUploadService_UploadChunk_AlreadyCompleted(t *testing.T) {
 			}, nil
 		},
 	}
-	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	result, err := svc.UploadChunk(
 		context.Background(),
@@ -266,7 +282,7 @@ func TestUploadService_UploadChunk_FillOrgTagUserError(t *testing.T) {
 			return nil, errors.New("db down")
 		},
 	}
-	svc := NewUploadService(&fakeUploadRepo{}, userRepo, nil, "uploads")
+	svc := NewUploadService(&fakeUploadRepo{}, userRepo, nil, "uploads", nil)
 
 	_, err := svc.UploadChunk(
 		context.Background(),
@@ -285,7 +301,7 @@ func TestUploadService_MergeChunks_NotFound(t *testing.T) {
 			return nil, gorm.ErrRecordNotFound
 		},
 	}
-	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	_, err := svc.MergeChunks(context.Background(), "md5-1", "a.pdf", 1)
 	if !errors.Is(err, ErrFileNotFound) {
@@ -304,7 +320,7 @@ func TestUploadService_MergeChunks_AlreadyMerged(t *testing.T) {
 			}, nil
 		},
 	}
-	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	result, err := svc.MergeChunks(context.Background(), "md5-2", "a.pdf", 11)
 	if err != nil {
@@ -330,7 +346,7 @@ func TestUploadService_MergeChunks_Incomplete(t *testing.T) {
 			return []int{0, 1}, nil
 		},
 	}
-	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	_, err := svc.MergeChunks(context.Background(), "md5-3", "a.pdf", 12)
 	if !errors.Is(err, ErrChunksIncomplete) {
@@ -356,7 +372,7 @@ func TestUploadService_UploadChunk_AlreadyUploadedIdempotentPath(t *testing.T) {
 			return []int{0, 1}, nil
 		},
 	}
-	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	result, err := svc.UploadChunk(
 		context.Background(),
@@ -394,7 +410,7 @@ func TestUploadService_UploadChunk_OrgTagFillSuccess(t *testing.T) {
 			return &model.User{ID: userID, PrimaryOrg: "team-user"}, nil
 		},
 	}
-	svc := NewUploadService(uploadRepo, userRepo, nil, "uploads")
+	svc := NewUploadService(uploadRepo, userRepo, nil, "uploads", nil)
 
 	_, err := svc.UploadChunk(
 		context.Background(),
@@ -416,7 +432,7 @@ func TestUploadService_CheckFile_RepoError(t *testing.T) {
 			return nil, errors.New("db error")
 		},
 	}
-	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	_, err := svc.CheckFile(context.Background(), "md5-err", 1)
 	if !errors.Is(err, ErrInternal) {
@@ -439,7 +455,7 @@ func TestUploadService_UploadChunk_NilReaderStillSupportedInIdempotentBranch(t *
 			return true, nil
 		},
 	}
-	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads")
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
 
 	result, err := svc.UploadChunk(
 		context.Background(),
@@ -452,5 +468,50 @@ func TestUploadService_UploadChunk_NilReaderStillSupportedInIdempotentBranch(t *
 	}
 	if result.Progress < 0 {
 		t.Fatalf("unexpected progress: %v", result.Progress)
+	}
+}
+
+func TestUploadService_ProduceFileTask_Success(t *testing.T) {
+	producer := &fakeTaskProducer{}
+	svc := &uploadService{
+		taskProducer: producer,
+	}
+
+	upload := &model.FileUpload{
+		FileMD5:  "md5-ok",
+		FileName: "a.pdf",
+		UserID:   9,
+		OrgTag:   "team-a",
+		IsPublic: true,
+	}
+	svc.produceFileTask(context.Background(), upload, "uploads/9/md5-ok/a.pdf")
+
+	if producer.called != 1 {
+		t.Fatalf("expected producer called once, got %d", producer.called)
+	}
+	if producer.lastTask.FileMD5 != "md5-ok" || producer.lastTask.ObjectKey != "uploads/9/md5-ok/a.pdf" {
+		t.Fatalf("unexpected produced task: %+v", producer.lastTask)
+	}
+}
+
+func TestUploadService_ProduceFileTask_FailureShouldNotPanic(t *testing.T) {
+	producer := &fakeTaskProducer{
+		produceFn: func(ctx context.Context, task tasks.FileProcessingTask) error {
+			return errors.New("kafka unavailable")
+		},
+	}
+	svc := &uploadService{
+		taskProducer: producer,
+	}
+
+	upload := &model.FileUpload{
+		FileMD5:  "md5-fail",
+		FileName: "b.pdf",
+		UserID:   10,
+	}
+	svc.produceFileTask(context.Background(), upload, "uploads/10/md5-fail/b.pdf")
+
+	if producer.called != 1 {
+		t.Fatalf("expected producer called once, got %d", producer.called)
 	}
 }
