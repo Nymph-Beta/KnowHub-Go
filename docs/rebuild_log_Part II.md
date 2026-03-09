@@ -751,3 +751,292 @@ curl -X POST http://localhost:8081/api/v1/upload/merge \
   -d '{"fileMd5":"abc123","fileName":"large.pdf"}'
 ```
 
+---
+
+## 阶段八 Kafka & Apache Tika 文档处理
+
+### 为什么从同步改为异步
+
+阶段七的 `MergeChunks` 已经能把文件合并进 MinIO，但如果在 HTTP 请求里同步做 "下载文件 → 文本提取"，用户会被长耗时阻塞，失败也难重试。
+
+阶段八把流程拆为：
+
+```text
+上传完成(SimpleUpload / MergeChunks)
+  → 发送 Kafka FileProcessingTask
+  → Consumer 拉取任务
+  → Processor 从 MinIO 下载
+  → Tika 提取文本
+```
+
+这样上传接口只负责"入库 + 入存储 + 发任务"，重处理交给后台 worker。
+
+---
+
+### 1. 配置扩展
+
+`internal/config/config.go` 与 `configs/config.yaml` 新增：
+
+- `kafka.brokers/topic/group_id/max_retry/retry_key_ttl_seconds`
+- `tika.base_url/timeout_seconds`
+
+默认值：
+
+- `topic: file-processing`
+- `group_id: file-processing-group`
+- `max_retry: 3`
+- `retry_key_ttl_seconds: 86400`（24h）
+
+---
+
+### 2. 任务结构（消息契约）
+
+新增：`pkg/tasks/tasks.go`
+
+```go
+type FileProcessingTask struct {
+    FileMD5   string `json:"file_md5"`
+    FileName  string `json:"file_name"`
+    UserID    uint   `json:"user_id"`
+    OrgTag    string `json:"org_tag"`
+    IsPublic  bool   `json:"is_public"`
+    ObjectKey string `json:"object_key"`
+}
+```
+
+这里明确**不放 `total_size`**。Processor 下载对象和提取文本不依赖这个字段，减少了 Producer/Consumer 的契约面积。
+
+`ObjectKey` 由生产端直接传入，消费端不再拼接路径规则，降低后续路径改动时的耦合风险。
+
+消息字段选择思考：
+
+- 当前字段：`file_md5/file_name/user_id/org_tag/is_public/object_key`
+- JSON 命名使用 snake_case，和配置与跨服务消息体风格一致，便于后续多语言消费者接入
+- 不带 `total_size`，因为阶段八链路（MinIO 下载 + Tika 提取）不依赖该字段，减少了契约面
+
+---
+
+### 3. Kafka 模块（segmentio/kafka-go）
+
+新增：`pkg/kafka/client.go`
+
+能力拆分：
+
+- Producer：`InitProducer`、`ProduceFileTask`、`CloseProducer`
+- Consumer：`StartConsumer`
+- 解耦接口：`TaskProcessor`（consumer 只调 `Process`，不关心内部实现）
+
+这里使用 `TaskProcessor` 接口而不是直接依赖具体 `pipeline.Processor`，目的是把"消费控制流"和"业务处理逻辑"解耦：
+
+- Kafka 层专注 Fetch/Commit/重试
+- 处理逻辑可以替换（后续阶段叠加分块、向量化）并可单测注入 fake
+
+#### 重试策略（按业务实体 fileMD5 计数）
+
+重试 key 设计为：`kafka:retry:{fileMD5}`
+
+处理失败时：
+
+```text
+INCR kafka:retry:{fileMD5}
+  ├─ count < max_retry  → 不提交 offset，等待 Kafka 重投递
+  └─ count >= max_retry → 提交 offset，跳过毒丸消息
+```
+
+处理成功时删除该 key。
+
+这意味着：同一个损坏文件（同 MD5）即便重复发多条消息，也共享失败预算，避免无限浪费；用户修复后重传会产生新 MD5，自然获得新的处理机会。
+
+offset 提交策略思考：
+
+- 如果消息处理失败但 offset 已提交，消息会被视为已消费，失败任务可能永久丢失
+- 当前实现只在"成功处理"或"达到最大重试后主动跳过"时提交 offset
+- 未达上限时不提交 offset，交给 Kafka 重投递，不做本地 sleep 重试，避免阻塞消费循环
+
+---
+
+### 4. Tika 客户端
+
+新增：`pkg/tika/client.go`
+
+核心行为：
+
+- `PUT {base_url}/tika`
+- `Accept: text/plain`
+- `Content-Type` 根据文件扩展名推断（`mime.TypeByExtension`）
+- 非 200 统一当作错误返回
+
+错误与结果处理思考：
+
+- Tika 非 200：按处理失败走 Kafka 重试/跳过策略，不能当作成功
+- 提取结果为空文本：阶段八先记录长度与日志；后续可在阶段九/十引入 OCR 或更细粒度策略
+
+---
+
+### 5. Pipeline Processor
+
+新增：`internal/pipeline/processor.go`
+
+`Process` 流程：
+
+1. 用 `object_key` 从 MinIO 获取对象流
+2. 调 `tikaClient.ExtractText`
+3. 记录提取成功日志（文本长度）
+
+阶段八只做到文本提取，不做分块和向量化（留给阶段九/十）。
+
+处理细节思考：
+
+- 下载路径直接用消息内 `object_key`，而不是在 consumer 里按规则拼 `uploads/{uid}/{md5}/{name}`
+- 0 字节文件当前会进入 Tika 并可能得到空文本；更合理的是在上传阶段增加最小大小校验（可作为后续增强）
+
+---
+
+### 6. UploadService 双入口触发任务
+
+更新：`internal/service/upload_service.go`
+
+新增可注入 `TaskProducer`，并封装 `produceFileTask`：
+
+- `SimpleUpload`：MinIO 上传 + DB 写入成功后发送 Kafka 任务
+- `MergeChunks`：合并成功并更新状态后发送 Kafka 任务
+
+发送失败只记日志，不影响上传/合并主流程成功返回。
+
+这里保留了两条触发入口，是为了避免"仅 merge 触发导致 simple 上传文件不进 RAG 管线"的问题。
+
+Kafka 发送失败不回滚上传请求的原因：文件本体与元数据已写成功，接口应返回成功并通过日志告警进入后续补偿。
+
+---
+
+### 7. main.go 启动顺序
+
+更新：`cmd/server/main.go`
+
+新增初始化链路：
+
+```text
+InitMinio
+→ InitProducer (失败即退出)
+→ NewUploadService(..., kafkaProducer)
+→ NewTikaClient
+→ NewProcessor
+→ go StartConsumer(...)
+```
+
+运行策略：
+
+- Kafka Producer 初始化失败：阻断启动（fail-fast）
+- Tika/Consumer 初始化失败：仅记录错误，服务继续提供上传能力
+- 停机时：先 cancel consumer context，再优雅关闭 HTTP 服务
+
+这组策略背后的取舍是：没有 Producer 就无法触发异步任务，属于硬依赖；而 Tika/Consumer 故障不应拖垮核心上传链路，属于可降级能力。
+
+---
+
+### 8. 服务启动方式（与阶段五 1.1 一致）
+
+这里不直接落地 `docker-compose.yml`，先采用"按需逐服务启动"的方式，等项目整体完成后再统一整理 compose。
+
+和阶段五的取舍一致：
+
+- 当前阶段目标是先把代码链路跑通，避免过早维护一份跨阶段的大型 compose 文件
+- 只维护 `config.yaml` 一份连接配置（`127.0.0.1:9092` / `127.0.0.1:9998`）
+- 部署阶段再统一沉淀到 `deployments/docker-compose.yml`
+
+示例启动命令（手动起 Kafka/Tika）：
+
+```bash
+# 1) 创建网络（一次即可）
+docker network create paismart-v2-net
+
+# 2) ZooKeeper
+docker run -d \
+  --name paismart-zookeeper \
+  --restart always \
+  --network paismart-v2-net \
+  -p 2181:2181 \
+  -e ZOOKEEPER_CLIENT_PORT=2181 \
+  -e ZOOKEEPER_TICK_TIME=2000 \
+  confluentinc/cp-zookeeper:7.6.1
+
+# 3) Kafka
+docker run -d \
+  --name paismart-kafka \
+  --restart always \
+  --network paismart-v2-net \
+  -p 9092:9092 \
+  -e KAFKA_BROKER_ID=1 \
+  -e KAFKA_ZOOKEEPER_CONNECT=paismart-zookeeper:2181 \
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT \
+  -e KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092 \
+  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://paismart-kafka:29092,PLAINTEXT_HOST://127.0.0.1:9092 \
+  -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  confluentinc/cp-kafka:7.6.1
+
+# 4) Apache Tika
+docker run -d \
+  --name paismart-tika \
+  --restart always \
+  -p 9998:9998 \
+  apache/tika:latest-full
+```
+
+---
+
+### 9. 测试补充
+
+- `pkg/kafka/client_test.go`
+  - Producer 序列化发送
+  - Consumer 失败未达阈值不提交
+  - 失败达阈值提交
+  - 成功后清理重试 key 并提交
+- `pkg/tika/client_test.go`
+  - 空配置校验
+  - 200 成功路径
+  - 非 200 错误路径
+  - MIME 推断
+- `internal/service/upload_service_test.go`
+  - 任务投递 helper 成功/失败分支
+
+---
+
+### 本阶段更新文件
+
+| 操作 | 文件 |
+| --- | --- |
+| 更新 | `internal/config/config.go` — 新增 Kafka/Tika 配置结构 |
+| 更新 | `configs/config.yaml` — 增加 Kafka/Tika 默认配置 |
+| 新增 | `pkg/tasks/tasks.go` — FileProcessingTask 消息结构 |
+| 新增 | `pkg/kafka/client.go` — Producer/Consumer + Redis 重试策略 |
+| 新增 | `pkg/tika/client.go` — Tika 文本提取客户端 |
+| 新增 | `internal/pipeline/processor.go` — MinIO 下载 + Tika 提取 |
+| 更新 | `internal/service/upload_service.go` — SimpleUpload/MergeChunks 双入口发送任务 |
+| 更新 | `cmd/server/main.go` — 初始化 Kafka/Tika/Consumer |
+| 新增 | `pkg/kafka/client_test.go`、`pkg/tika/client_test.go` |
+| 更新 | `internal/service/upload_service_test.go` |
+
+### 验收命令
+
+```bash
+# 1) 启动中间件（按需逐服务）
+#    参考上文第 8 节的 docker run 命令启动 zookeeper/kafka/tika
+
+# 2) 走简单上传（会触发 Kafka 任务）
+curl -X POST http://localhost:8081/api/v1/upload/simple \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@test.pdf"
+
+# 3) 或走分片 + merge（merge 后触发 Kafka 任务）
+curl -X POST http://localhost:8081/api/v1/upload/merge \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"fileMd5":"xxx","fileName":"test.pdf"}'
+
+# 4) 观察日志关键词
+# [Kafka] 文件处理任务发送成功
+# [Consumer] 收到 Kafka 消息
+# [Processor] 开始处理文件
+# [Processor] Tika 提取文本成功
+```
