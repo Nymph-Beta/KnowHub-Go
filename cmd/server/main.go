@@ -1,16 +1,20 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"pai_smart_go_v2/internal/config"
 	"pai_smart_go_v2/internal/handler"
 	"pai_smart_go_v2/internal/middleware"
+	"pai_smart_go_v2/internal/pipeline"
 	"pai_smart_go_v2/internal/repository"
 	"pai_smart_go_v2/internal/service"
 	"pai_smart_go_v2/pkg/database"
+	"pai_smart_go_v2/pkg/kafka"
 	"pai_smart_go_v2/pkg/log"
 	"pai_smart_go_v2/pkg/storage"
+	"pai_smart_go_v2/pkg/tika"
 	"pai_smart_go_v2/pkg/token"
 
 	"net/http"
@@ -18,8 +22,6 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
-	"context"
 
 	"github.com/gin-gonic/gin"
 )
@@ -45,6 +47,15 @@ func main() {
 
 	// 初始化 MinIO 对象存储客户端
 	storage.InitMinio(cfg.MinIO)
+	if err := kafka.InitProducer(cfg.Kafka); err != nil {
+		log.Fatal("初始化 Kafka Producer 失败", err)
+		return
+	}
+	defer func() {
+		if err := kafka.CloseProducer(); err != nil {
+			log.Errorf("关闭 Kafka Producer 失败: %v", err)
+		}
+	}()
 
 	// router := gin.Default()
 	// router.GET("/ping", func(c *gin.Context) {
@@ -67,7 +78,13 @@ func main() {
 	// 3. Service (注入 Repository 和 JWTManager)
 	orgTagService := service.NewOrgTagService(orgTagRepo)
 	userService := service.NewUserService(userRepo, orgTagRepo, jwtManager)
-	uploadService := service.NewUploadService(uploadRepo, userRepo, storage.MinIOClient, cfg.MinIO.BucketName)
+	uploadService := service.NewUploadService(
+		uploadRepo,
+		userRepo,
+		storage.MinIOClient,
+		cfg.MinIO.BucketName,
+		kafka.NewProducerClient(),
+	)
 
 	// 4. Handler (注入 Service)
 	userHandler := handler.NewUserHandler(userService)
@@ -145,6 +162,22 @@ func main() {
 
 	// r.Run(":" + cfg.Server.Port)
 
+	consumerCancel := func() {}
+	tikaClient, err := tika.NewClient(cfg.Tika)
+	if err != nil {
+		log.Errorf("初始化 Tika 客户端失败，跳过后台文档处理 Consumer: %v", err)
+	} else {
+		processor := pipeline.NewProcessor(tikaClient, storage.MinIOClient, cfg.MinIO.BucketName)
+		consumerCtx, cancel := context.WithCancel(context.Background())
+		consumerCancel = cancel
+		go func() {
+			retryStore := kafka.NewRedisRetryStore(database.RDB)
+			if consumeErr := kafka.StartConsumer(consumerCtx, cfg.Kafka, retryStore, processor); consumeErr != nil {
+				log.Errorf("Kafka Consumer 退出: %v", consumeErr)
+			}
+		}()
+	}
+
 	// 启动 HTTP 服务器并实现优雅停机
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%s", cfg.Server.Port),
@@ -163,6 +196,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Info("接收到停机信号，正在关闭服务...")
+	consumerCancel()
 
 	// 设置一个5秒的超时上下文
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

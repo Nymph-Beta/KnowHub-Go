@@ -15,6 +15,7 @@ import (
 	"pai_smart_go_v2/internal/model"
 	"pai_smart_go_v2/internal/repository"
 	"pai_smart_go_v2/pkg/log"
+	"pai_smart_go_v2/pkg/tasks"
 
 	"github.com/minio/minio-go/v7"
 	"gorm.io/gorm"
@@ -93,12 +94,18 @@ type UploadService interface {
 	MergeChunks(ctx context.Context, fileMD5 string, fileName string, userID uint) (*MergeResult, error)
 }
 
+// TaskProducer 抽象了文件处理任务的异步投递能力（如 Kafka producer）。
+type TaskProducer interface {
+	ProduceFileTask(ctx context.Context, task tasks.FileProcessingTask) error
+}
+
 // uploadService 是 UploadService 接口的具体实现
 type uploadService struct {
-	uploadRepo  repository.UploadRepository
-	userRepo    repository.UserRepository
-	minioClient *minio.Client
-	bucketName  string
+	uploadRepo   repository.UploadRepository
+	userRepo     repository.UserRepository
+	minioClient  *minio.Client
+	bucketName   string
+	taskProducer TaskProducer
 }
 
 // NewUploadService 创建 UploadService 实例。
@@ -108,12 +115,14 @@ func NewUploadService(
 	userRepo repository.UserRepository,
 	minioClient *minio.Client,
 	bucketName string,
+	taskProducer TaskProducer,
 ) UploadService {
 	return &uploadService{
-		uploadRepo:  uploadRepo,
-		userRepo:    userRepo,
-		minioClient: minioClient,
-		bucketName:  bucketName,
+		uploadRepo:   uploadRepo,
+		userRepo:     userRepo,
+		minioClient:  minioClient,
+		bucketName:   bucketName,
+		taskProducer: taskProducer,
 	}
 }
 
@@ -210,6 +219,7 @@ func (s *uploadService) SimpleUpload(
 		log.Errorf("写入文件记录失败: %v", err)
 		return nil, ErrInternal
 	}
+	s.produceFileTask(ctx, upload, objectKey)
 
 	return &UploadResult{
 		FileMD5:   fileMD5,
@@ -464,6 +474,7 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 		log.Errorf("MergeChunks: 更新文件状态失败: %v", err)
 		return nil, ErrInternal
 	}
+	s.produceFileTask(ctx, upload, destKey)
 
 	go s.cleanupAfterMerge(fileMD5, userID, totalChunks)
 
@@ -497,3 +508,23 @@ func makeRange(n int) []int {
 	return result
 }
 
+func (s *uploadService) produceFileTask(ctx context.Context, upload *model.FileUpload, objectKey string) {
+	if s.taskProducer == nil || upload == nil {
+		return
+	}
+
+	task := tasks.FileProcessingTask{
+		FileMD5:   upload.FileMD5,
+		FileName:  upload.FileName,
+		UserID:    upload.UserID,
+		OrgTag:    upload.OrgTag,
+		IsPublic:  upload.IsPublic,
+		ObjectKey: objectKey,
+	}
+
+	if err := s.taskProducer.ProduceFileTask(ctx, task); err != nil {
+		log.Errorf("发送文件处理任务失败(不影响主流程): md5=%s err=%v", upload.FileMD5, err)
+		return
+	}
+	log.Infof("文件处理任务已投递: md5=%s", upload.FileMD5)
+}
