@@ -16,10 +16,10 @@ log:
 
 database:
   mysql:
-    dsn: "root:PaiSmart2025@tcp(127.0.0.1:3307)/paismart_v2?parseTime=True"
+    dsn: "root:PaiSmart2025@tcp(127.0.0.1:3308)/paismart_v2?parseTime=True"
   redis: 
-    addr: "127.0.0.1:6379"
-    password: ""
+    addr: "127.0.0.1:6381"
+    password: "PaiSmart2025"
     db: 1
 
 jwt:
@@ -28,8 +28,20 @@ jwt:
   refresh_token_expire_days: 7
 
 minio:
-  endpoint: "127.0.0.1:9300"
+  endpoint: "127.0.0.1:9302"
   access_key_id: "minioadmin"
   secret_access_key: "minioadmin"
   use_ssl: false
   bucket_name: "uploads"
+
+kafka:
+  brokers:
+    - "127.0.0.1:9093"
+  topic: "file-processing"
+  group_id: "file-processing-group"
+  max_retry: 3
+  retry_key_ttl_seconds: 86400
+
+tika:
+  base_url: "http://127.0.0.1:9999"
+  timeout_seconds: 10
