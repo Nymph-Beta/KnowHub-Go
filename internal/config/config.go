@@ -16,6 +16,8 @@ type Config struct {
 	Database DatabaseConfig `mapstructure:"database"`
 	JWT      JWTConfig      `mapstructure:"jwt"`
 	MinIO    MinIOConfig    `mapstructure:"minio"`
+	Kafka    KafkaConfig    `mapstructure:"kafka"`
+	Tika     TikaConfig     `mapstructure:"tika"`
 }
 
 // ServerConfig 存储服务器相关的配置。
@@ -63,6 +65,19 @@ type MinIOConfig struct {
 	SecretAccessKey string `mapstructure:"secret_access_key"`
 	UseSSL          bool   `mapstructure:"use_ssl"`
 	BucketName      string `mapstructure:"bucket_name"`
+}
+
+type KafkaConfig struct {
+	Brokers            []string `mapstructure:"brokers"`
+	Topic              string   `mapstructure:"topic"`
+	GroupID            string   `mapstructure:"group_id"`
+	MaxRetry           int      `mapstructure:"max_retry"`
+	RetryKeyTTLSeconds int      `mapstructure:"retry_key_ttl_seconds"`
+}
+
+type TikaConfig struct {
+	BaseURL        string `mapstructure:"base_url"`
+	TimeoutSeconds int    `mapstructure:"timeout_seconds"`
 }
 
 // init 初始化配置加载，从指定的路径读取 YAML 配置文件并解析导入到 Conf 变量中
