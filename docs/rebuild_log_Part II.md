@@ -1004,18 +1004,20 @@ docker run -d \
 
 ### 本阶段更新文件
 
-| 操作 | 文件 |
-| --- | --- |
-| 更新 | `internal/config/config.go` — 新增 Kafka/Tika 配置结构 |
-| 更新 | `configs/config.yaml` — 增加 Kafka/Tika 默认配置 |
-| 新增 | `pkg/tasks/tasks.go` — FileProcessingTask 消息结构 |
-| 新增 | `pkg/kafka/client.go` — Producer/Consumer + Redis 重试策略 |
-| 新增 | `pkg/tika/client.go` — Tika 文本提取客户端 |
-| 新增 | `internal/pipeline/processor.go` — MinIO 下载 + Tika 提取 |
-| 更新 | `internal/service/upload_service.go` — SimpleUpload/MergeChunks 双入口发送任务 |
-| 更新 | `cmd/server/main.go` — 初始化 Kafka/Tika/Consumer |
-| 新增 | `pkg/kafka/client_test.go`、`pkg/tika/client_test.go` |
-| 更新 | `internal/service/upload_service_test.go` |
+
+| 操作  | 文件                                                                      |
+| --- | ----------------------------------------------------------------------- |
+| 更新  | `internal/config/config.go` — 新增 Kafka/Tika 配置结构                        |
+| 更新  | `configs/config.yaml` — 增加 Kafka/Tika 默认配置                              |
+| 新增  | `pkg/tasks/tasks.go` — FileProcessingTask 消息结构                          |
+| 新增  | `pkg/kafka/client.go` — Producer/Consumer + Redis 重试策略                  |
+| 新增  | `pkg/tika/client.go` — Tika 文本提取客户端                                     |
+| 新增  | `internal/pipeline/processor.go` — MinIO 下载 + Tika 提取                   |
+| 更新  | `internal/service/upload_service.go` — SimpleUpload/MergeChunks 双入口发送任务 |
+| 更新  | `cmd/server/main.go` — 初始化 Kafka/Tika/Consumer                          |
+| 新增  | `pkg/kafka/client_test.go`、`pkg/tika/client_test.go`                    |
+| 更新  | `internal/service/upload_service_test.go`                               |
+
 
 ### 验收命令
 
@@ -1040,3 +1042,219 @@ curl -X POST http://localhost:8081/api/v1/upload/merge \
 # [Processor] 开始处理文件
 # [Processor] Tika 提取文本成功
 ```
+
+## 阶段九 文本分块 & 文档向量表
+
+阶段八的 `Processor` 只做到"从 MinIO 下载文件并交给 Tika 提取文本"。这能证明异步链路打通了，但还不够支持后续 RAG 检索，因为检索的最小单位不应该是整篇文档，而应该是一段段较短的 chunk。
+
+阶段九的目标就是把阶段八管线继续往后推进：
+
+```text
+Kafka 消息
+  -> Processor 下载对象
+  -> Tika 提取原始文本
+  -> 按 rune 做固定长度 + overlap 分块
+  -> 删除旧 chunk 记录（幂等）
+  -> 批量写入 document_vectors
+```
+
+---
+
+### 1. DocumentVector 模型
+
+新增：`internal/model/document_vector.go`
+
+```go
+type DocumentVector struct {
+    ID           uint
+    FileMD5      string
+    ChunkID      int
+    TextContent  string
+    ModelVersion string
+    UserID       uint
+    OrgTag       string
+    IsPublic     bool
+    CreatedAt    time.Time
+    UpdatedAt    time.Time
+}
+```
+
+字段取舍：
+
+- `file_md5 + chunk_id` 标识"同一文件的第几个文本块"
+- `text_content` 存 chunk 原文，使用 `text` 类型而不是 `varchar`
+- `model_version` 先保留为空，阶段九不做 embedding，阶段十才会真正用到
+- `user_id / org_tag / is_public` 直接冗余到 chunk 级别，后续检索时可以直接按权限过滤，而不用每次回表查 `file_uploads`
+
+表名保持为 `document_vectors`，与学习文档和原项目命名一致。
+
+---
+
+### 2. DocumentVectorRepository
+
+新增：`internal/repository/document_vector_repository.go`
+
+提供三个核心能力：
+
+- `BatchCreate(vectors []model.DocumentVector)`：使用 `CreateInBatches(..., 100)` 分批写入
+- `FindByFileMD5(fileMD5 string)`：按 `chunk_id ASC` 查询一个文件的全部分块
+- `DeleteByFileMD5(fileMD5 string)`：删除旧记录，保证重复消费同一文件消息时不会累积重复 chunk
+
+这里没有把 `Delete + BatchCreate` 放到事务里。原因和教学文档一致：当前链路由 Kafka 驱动，若出现"删成功但写失败"，消息仍会进入重试，最终可以达到一致状态。这个阶段先保持实现简单，避免为了事务把 `Processor` 和 Repository 的职责边界又搅混。
+
+---
+
+### 3. Processor 扩展：从抽文本到落 chunk
+
+更新：`internal/pipeline/processor.go`
+
+`Processor` 新增依赖：
+
+```go
+type Processor struct {
+    tikaClient    *tika.Client
+    minioClient   *minio.Client
+    bucketName    string
+    docVectorRepo repository.DocumentVectorRepository
+}
+```
+
+`Process` 现在的完整流程变为：
+
+1. 校验 `tikaClient / minioClient / docVectorRepo / objectKey`
+2. 从 MinIO 获取对象并 `Stat`
+3. 调用 Tika 提取文本
+4. 空文本直接 warning 并返回，不写库
+5. 调用 `splitText(text, 1000, 100)` 做固定长度重叠分块
+6. 先 `DeleteByFileMD5`
+7. 把 chunk 映射为 `[]DocumentVector`
+8. `BatchCreate`
+9. 记录分块数和写库成功日志
+
+新增的幂等逻辑：
+
+```text
+重复消息到来
+  -> 先删旧的 document_vectors
+  -> 再写新的 document_vectors
+  -> 最终数据库只保留一份当前结果
+```
+
+---
+
+### 4. splitText 设计
+
+本阶段最核心的算法就是 `splitText`。
+
+实现选择：
+
+- 按 `[]rune` 而不是 `[]byte` 分块，避免中文被截断成乱码
+- 参数固定为 `chunkSize=1000`、`overlap=100`
+- 当 `chunkSize <= overlap` 时直接返回错误，避免步长为 0 或负数导致死循环
+- 空字符串返回空切片
+- 纯空白 chunk 会被跳过
+
+核心逻辑：
+
+```go
+runes := []rune(text)
+step := chunkSize - overlap
+
+for start := 0; start < len(runes); start += step {
+    end := min(start+chunkSize, len(runes))
+    chunks = append(chunks, string(runes[start:end]))
+    if end == len(runes) {
+        break
+    }
+}
+```
+
+这是一种很朴素的 fixed-size chunking。优点是简单、稳定、可预测；缺点是可能在句子中间断开。更高级的按段落/标题/语义边界切分放到后续优化阶段再做，不在阶段九提前复杂化。
+
+---
+
+### 5. main.go 与迁移接线
+
+更新：
+
+- `pkg/database/mysql.go`
+- `cmd/server/main.go`
+
+接线内容：
+
+1. `RunMigrate()` 新增 `&model.DocumentVector{}`
+2. `main.go` 新建 `docVectorRepo := repository.NewDocumentVectorRepository(database.DB)`
+3. `NewProcessor(...)` 注入 `docVectorRepo`
+
+也就是说，阶段九落地后，上传后的 Kafka/Tika 异步链路第一次真正产生了数据库侧的"可检索中间结果"。
+
+---
+
+### 6. 测试补充
+
+新增测试：
+
+- `internal/pipeline/processor_test.go`
+  - 长文本重叠分块
+  - 中文 rune 安全分块
+  - 短文本单 chunk
+  - 空文本
+  - 非法配置（`chunkSize <= overlap`）
+  - `buildDocumentVectors` 元数据映射
+- `internal/repository/document_vector_repository_test.go`
+  - `BatchCreate`
+  - `FindByFileMD5`
+  - `DeleteByFileMD5`
+
+本地回归结果：
+
+```bash
+env GOCACHE=$(pwd)/.tmp/gocache /home/yyy/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.11.linux-amd64/bin/go test ./...
+```
+
+结果：
+
+- `internal/pipeline` 通过
+- `internal/repository` 通过
+- `internal/service` 通过
+- 全仓 `go test ./...` 通过
+
+---
+
+### 7. 本阶段更新文件
+
+
+| 操作  | 文件                                                              |
+| --- | --------------------------------------------------------------- |
+| 新增  | `internal/model/document_vector.go` — 文档分块模型                    |
+| 新增  | `internal/repository/document_vector_repository.go` — 文档分块仓储    |
+| 新增  | `internal/repository/document_vector_repository_test.go` — 仓储测试 |
+| 更新  | `internal/pipeline/processor.go` — 增加分块、幂等删除和批量写入               |
+| 新增  | `internal/pipeline/processor_test.go` — 分块算法测试                  |
+| 更新  | `pkg/database/mysql.go` — 迁移 `document_vectors`                 |
+| 更新  | `cmd/server/main.go` — 注入 `docVectorRepo` 到 `Processor`         |
+
+
+---
+
+### 8. 验收方式
+
+```bash
+# 1) 上传一个可被 Tika 提取正文的文档
+curl -X POST http://localhost:8081/api/v1/upload/simple \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@sample.pdf"
+
+# 2) 观察日志
+# [Processor] Tika 提取文本成功: md5=..., textLength=...
+# [Processor] 文本分块完成: md5=..., chunks=...
+# [Processor] 批量写入 document_vectors 成功: md5=...
+
+# 3) 数据库验证
+mysql> SELECT file_md5, chunk_id, LEFT(text_content, 50)
+       FROM document_vectors
+       WHERE file_md5 = 'xxx'
+       ORDER BY chunk_id;
+```
+
+到这里，阶段九已经把阶段八的"抽文本"推进成了"抽文本并沉淀 chunk"，阶段十就可以在这个结果集上继续做 embedding 和向量索引，而不必再回头处理原始长文本。
