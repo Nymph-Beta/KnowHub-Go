@@ -6,10 +6,11 @@ TOKEN="${TOKEN:-}"
 LOGIN_USERNAME="${LOGIN_USERNAME:-}"
 LOGIN_PASSWORD="${LOGIN_PASSWORD:-}"
 AUTO_REGISTER="${AUTO_REGISTER:-1}"
-AUTO_USER_PREFIX="${AUTO_USER_PREFIX:-stage9_accept}"
-AUTO_PASSWORD="${AUTO_PASSWORD:-Passw0rd!Stage9}"
+AUTO_USER_PREFIX="${AUTO_USER_PREFIX:-stage69_accept}"
+AUTO_PASSWORD="${AUTO_PASSWORD:-Passw0rd!Stage69}"
 ORG_TAG="${ORG_TAG:-}"
-FILE=""
+STAGE6_FILE=""
+PDF_FILE=""
 LOG_FILE="${LOG_FILE:-./logs/app.log}"
 WAIT_SECONDS="${WAIT_SECONDS:-25}"
 POLL_MS="${POLL_MS:-500}"
@@ -26,7 +27,10 @@ KAFKA_TOPIC="${KAFKA_TOPIC:-file-processing}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-WORK_DIR="${WORK_DIR:-/tmp/paismart-stage9-acceptance-$$}"
+STAGE6_SCRIPT="${SCRIPT_DIR}/stage6_simple_upload_acceptance.sh"
+STAGE7_SCRIPT="${SCRIPT_DIR}/stage7_chunk_upload_acceptance.sh"
+DEFAULT_PDF_FILE="${REPO_ROOT}/scripts/test_data/Hashimoto.pdf"
+WORK_DIR="${WORK_DIR:-/tmp/paismart-stage6-to-9-acceptance-$$}"
 GO_BIN="${GO_BIN:-/home/yyy/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.11.linux-amd64/bin/go}"
 GO_CACHE_DIR="${GO_CACHE_DIR:-${REPO_ROOT}/.tmp/gocache}"
 
@@ -36,31 +40,25 @@ REQUEST_BODY=""
 usage() {
   cat <<'EOF'
 Usage:
-  stage9_chunk_vector_acceptance.sh [options]
+  stage6_to_9_acceptance.sh [options]
 
 Options:
-  -b <base_url>   服务地址，默认: http://localhost:8081
-  -t <token>      直接指定 Bearer token（优先）
-  -u <username>   登录用户名（当未提供 -t 时使用；不传则自动注册测试用户）
-  -p <password>   登录密码（与 -u 配套）
-  -o <org_tag>    可选 orgTag（simple upload 表单字段）
-  -f <file>       上传文件（可选，不传则自动生成较长 txt）
-  -l <log_file>   应用日志文件路径，默认: ./logs/app.log
-  -w <seconds>    等待异步链路日志/分块入库的超时秒数，默认: 25
-  -P              isPublic=true（默认 false）
-  -k              保留临时目录（默认自动清理）
-  -v              输出详细响应
-  -D              跳过 Docker 容器运行状态检查
-  -I              跳过重复消息幂等性验证
-  -h              显示帮助
-
-Env (optional):
-  MYSQL_DSN=root:PaiSmart2025@tcp(127.0.0.1:3307)/paismart_v2?parseTime=True
-  KAFKA_BROKERS=127.0.0.1:9093
-  KAFKA_TOPIC=file-processing
-  GO_BIN=/path/to/go
-  GO_CACHE_DIR=./.tmp/gocache
-  CHECK_IDEMPOTENCY=1
+  --stage6-file    阶段六 simple upload 文件（可选，不传则自动生成临时 txt）
+  --pdf-file       阶段七到阶段九共用的 PDF 文件，默认: scripts/test_data/Hashimoto.pdf
+  --stage7-file    --pdf-file 的兼容别名
+  -b <base_url>    服务地址，默认: http://localhost:8081
+  -t <token>       直接指定 Bearer token（优先）
+  -u <username>    登录用户名（当未提供 -t 时使用；不传则自动注册测试用户）
+  -p <password>    登录密码（与 -u 配套）
+  -o <org_tag>     可选 orgTag
+  -l <log_file>    应用日志文件路径，默认: ./logs/app.log
+  -w <seconds>     等待异步链路日志/分块入库的超时秒数，默认: 25
+  -P               isPublic=true（默认 false）
+  -k               保留临时目录
+  -v               输出详细响应
+  -D               跳过 Docker 容器运行状态检查
+  -I               跳过重复消息幂等性验证
+  -h               显示帮助
 EOF
 }
 
@@ -230,39 +228,82 @@ replay_file_task() {
   )
 }
 
-while getopts ":b:t:u:p:o:f:l:w:PkDvIh" opt; do
-  case "${opt}" in
-    b) BASE_URL="${OPTARG}" ;;
-    t) TOKEN="${OPTARG}" ;;
-    u) LOGIN_USERNAME="${OPTARG}" ;;
-    p) LOGIN_PASSWORD="${OPTARG}" ;;
-    o) ORG_TAG="${OPTARG}" ;;
-    f) FILE="${OPTARG}" ;;
-    l) LOG_FILE="${OPTARG}" ;;
-    w) WAIT_SECONDS="${OPTARG}" ;;
-    P) IS_PUBLIC="true" ;;
-    k) KEEP_TMP=1 ;;
-    D) CHECK_DOCKER=0 ;;
-    I) CHECK_IDEMPOTENCY=0 ;;
-    v) VERBOSE=1 ;;
-    h)
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --stage6-file)
+      STAGE6_FILE="${2:-}"
+      shift 2
+      ;;
+    --pdf-file|--stage7-file)
+      PDF_FILE="${2:-}"
+      shift 2
+      ;;
+    -b)
+      BASE_URL="${2:-}"
+      shift 2
+      ;;
+    -t)
+      TOKEN="${2:-}"
+      shift 2
+      ;;
+    -u)
+      LOGIN_USERNAME="${2:-}"
+      shift 2
+      ;;
+    -p)
+      LOGIN_PASSWORD="${2:-}"
+      shift 2
+      ;;
+    -o)
+      ORG_TAG="${2:-}"
+      shift 2
+      ;;
+    -l)
+      LOG_FILE="${2:-}"
+      shift 2
+      ;;
+    -w)
+      WAIT_SECONDS="${2:-}"
+      shift 2
+      ;;
+    -P)
+      IS_PUBLIC="true"
+      shift
+      ;;
+    -k)
+      KEEP_TMP=1
+      shift
+      ;;
+    -v)
+      VERBOSE=1
+      shift
+      ;;
+    -D)
+      CHECK_DOCKER=0
+      shift
+      ;;
+    -I)
+      CHECK_IDEMPOTENCY=0
+      shift
+      ;;
+    -h|--help)
       usage
       exit 0
       ;;
-    :)
-      fail "参数 -${OPTARG} 缺少值"
-      ;;
-    \?)
-      fail "未知参数: -${OPTARG}"
+    *)
+      fail "未知参数: $1"
       ;;
   esac
 done
+
+[[ -x "${STAGE6_SCRIPT}" ]] || fail "缺少脚本: ${STAGE6_SCRIPT}"
+[[ -x "${STAGE7_SCRIPT}" ]] || fail "缺少脚本: ${STAGE7_SCRIPT}"
+[[ -x "${GO_BIN}" ]] || fail "GO_BIN 不存在或不可执行: ${GO_BIN}"
 
 require_cmd curl
 require_cmd jq
 require_cmd awk
 require_cmd rg
-[[ -x "${GO_BIN}" ]] || fail "GO_BIN 不存在或不可执行: ${GO_BIN}"
 
 mkdir -p "${WORK_DIR}"
 if [[ "${KEEP_TMP}" -eq 0 ]]; then
@@ -270,6 +311,22 @@ if [[ "${KEEP_TMP}" -eq 0 ]]; then
 fi
 
 cd "${REPO_ROOT}"
+
+if [[ -z "${PDF_FILE}" ]]; then
+  PDF_FILE="${DEFAULT_PDF_FILE}"
+fi
+[[ -f "${PDF_FILE}" ]] || fail "PDF 文件不存在: ${PDF_FILE}"
+
+if [[ -z "${STAGE6_FILE}" ]]; then
+  STAGE6_FILE="${WORK_DIR}/stage6_phase_auto_$(date +%s).txt"
+  UNIQUE_RUN_ID="$(date +%s%N)_$RANDOM"
+  {
+    echo "stage6 to stage9 acceptance"
+    echo "run_id=${UNIQUE_RUN_ID}"
+    echo "simple upload only uses a temporary txt file"
+  } > "${STAGE6_FILE}"
+fi
+[[ -f "${STAGE6_FILE}" ]] || fail "阶段六文件不存在: ${STAGE6_FILE}"
 
 if [[ "${CHECK_DOCKER}" -eq 1 ]]; then
   require_cmd docker
@@ -305,55 +362,69 @@ assert_status 200 "获取当前用户信息失败"
 USER_ID="$(jq -er '.data.id' <<<"${REQUEST_BODY}")" || fail "无法解析 userID"
 pass "当前用户 ID: ${USER_ID}"
 
-GENERATED_FILE=0
-if [[ -z "${FILE}" ]]; then
-  FILE="${WORK_DIR}/stage9_auto_$(date +%s).txt"
-  GENERATED_FILE=1
-  UNIQUE_RUN_ID="$(date +%s%N)_$RANDOM"
-  : > "${FILE}"
-  printf 'stage9 acceptance run id: %s\n' "${UNIQUE_RUN_ID}" >> "${FILE}"
-  for i in $(seq 1 180); do
-    printf 'stage9 acceptance chunk line %03d run=%s PaiSmart RAG text splitting 验证文本分块与重叠窗口。\n' "${i}" "${UNIQUE_RUN_ID}" >> "${FILE}"
-  done
+log "开始整阶段验收：阶段六(simple txt) -> 阶段七到九(shared pdf)"
+
+stage6_cmd=(
+  "${STAGE6_SCRIPT}"
+  -b "${BASE_URL}"
+  -t "${TOKEN}"
+  -o "${ORG_TAG}"
+  -f "${STAGE6_FILE}"
+  -D
+)
+if [[ "${VERBOSE}" -eq 1 ]]; then
+  stage6_cmd+=(-v)
 fi
-[[ -f "${FILE}" ]] || fail "文件不存在: ${FILE}"
+"${stage6_cmd[@]}"
 
-FILE_NAME="$(basename "${FILE}")"
-log "执行 stage9 simple upload: ${FILE_NAME}"
-request \
-  -X POST "${BASE_URL}/api/v1/upload/simple" \
-  -H "Authorization: Bearer ${TOKEN}" \
-  -F "orgTag=${ORG_TAG}" \
-  -F "file=@${FILE}"
-assert_status 200 "simple upload 失败"
-FILE_MD5="$(jq -er '.data.fileMd5' <<<"${REQUEST_BODY}")" || fail "无法解析上传响应中的 fileMd5"
-IS_QUICK="$(jq -r '.data.isQuick' <<<"${REQUEST_BODY}")" || fail "无法解析上传响应中的 isQuick"
-[[ "${IS_QUICK}" == "false" ]] || fail "stage9 验收要求新文件触发完整异步链路，但当前命中了秒传，请重新运行"
-pass "simple upload 通过，md5=${FILE_MD5}"
-
-OBJECT_KEY="uploads/${USER_ID}/${FILE_MD5}/${FILE_NAME}"
-
-[[ -f "${LOG_FILE}" ]] || fail "日志文件不存在: ${LOG_FILE}"
-wait_for_log_pattern "文件处理任务已投递: md5=${FILE_MD5}" "Producer 投递日志命中"
-wait_for_log_pattern "[Consumer] 文件任务处理成功: MD5=${FILE_MD5}" "Consumer 成功日志命中"
-wait_for_log_pattern "[Processor] Tika 提取文本成功: md5=${FILE_MD5}" "Tika 提取成功日志命中"
-wait_for_log_pattern "[Processor] 文本分块完成: md5=${FILE_MD5}" "文本分块完成日志命中"
-wait_for_log_pattern "[Processor] 批量写入 document_vectors 成功: md5=${FILE_MD5}" "document_vectors 写入日志命中"
-
-EXPECTED_MIN_CHUNKS=1
-if [[ "${GENERATED_FILE}" -eq 1 ]]; then
-  EXPECTED_MIN_CHUNKS=2
+STAGE7_RESULT_JSON="${WORK_DIR}/stage7_result.json"
+stage7_cmd=(
+  "${STAGE7_SCRIPT}"
+  -b "${BASE_URL}"
+  -t "${TOKEN}"
+  -o "${ORG_TAG}"
+  -f "${PDF_FILE}"
+)
+if [[ "${IS_PUBLIC}" == "true" ]]; then
+  stage7_cmd+=(-P)
 fi
+if [[ "${KEEP_TMP}" -eq 1 ]]; then
+  stage7_cmd+=(-k)
+fi
+if [[ "${VERBOSE}" -eq 1 ]]; then
+  stage7_cmd+=(-v)
+fi
+
+log "执行阶段七主链路，输出将直接作为阶段九校验输入"
+RESULT_JSON_FILE="${STAGE7_RESULT_JSON}" \
+PIPELINE_LOG_FILE="${LOG_FILE}" \
+PIPELINE_WAIT_SECONDS="${WAIT_SECONDS}" \
+PIPELINE_POLL_MS="${POLL_MS}" \
+"${stage7_cmd[@]}"
+
+[[ -s "${STAGE7_RESULT_JSON}" ]] || fail "阶段七结果文件为空，无法继续阶段九校验"
+jq -e . "${STAGE7_RESULT_JSON}" >/dev/null 2>&1 || fail "阶段七结果文件不是有效 JSON"
+
+FILE_MD5="$(jq -er '.fileMd5' "${STAGE7_RESULT_JSON}")" || fail "无法解析阶段七 fileMd5"
+FILE_NAME="$(jq -er '.fileName' "${STAGE7_RESULT_JSON}")" || fail "无法解析阶段七 fileName"
+RESULT_USER_ID="$(jq -er '.userId' "${STAGE7_RESULT_JSON}")" || fail "无法解析阶段七 userId"
+RESULT_ORG_TAG="$(jq -er '.orgTag' "${STAGE7_RESULT_JSON}")" || fail "无法解析阶段七 orgTag"
+RESULT_IS_PUBLIC="$(jq -r '.isPublic' "${STAGE7_RESULT_JSON}")" || fail "无法解析阶段七 isPublic"
+OBJECT_KEY="$(jq -er '.objectKey' "${STAGE7_RESULT_JSON}")" || fail "无法解析阶段七 objectKey"
+
+[[ "${RESULT_USER_ID}" == "${USER_ID}" ]] || fail "阶段七 userId 与登录用户不一致"
+
+wait_for_log_pattern "[Processor] 文本分块完成: md5=${FILE_MD5}" "阶段九文本分块完成日志命中"
+wait_for_log_pattern "[Processor] 批量写入 document_vectors 成功: md5=${FILE_MD5}" "阶段九 document_vectors 写入日志命中"
 
 PROBE_STDOUT="${WORK_DIR}/vector_probe.json"
 PROBE_STDERR="${WORK_DIR}/vector_probe.err"
+EXPECTED_MIN_CHUNKS=1
 if ! run_vector_probe "${FILE_MD5}" "${EXPECTED_MIN_CHUNKS}" "${PROBE_STDOUT}" "${PROBE_STDERR}"; then
   [[ ! -s "${PROBE_STDERR}" ]] || printf '[DEBUG] vector probe stderr:\n%s\n' "$(cat "${PROBE_STDERR}")" >&2
   [[ ! -s "${PROBE_STDOUT}" ]] || printf '[DEBUG] vector probe stdout:\n%s\n' "$(cat "${PROBE_STDOUT}")" >&2
   fail "document_vectors 探针执行失败"
 fi
-jq -e . "${PROBE_STDOUT}" >/dev/null 2>&1 || fail "document_vectors 探针输出不是有效 JSON"
-
 INITIAL_CHUNK_COUNT="$(jq -er '.chunkCount' "${PROBE_STDOUT}")" || fail "无法解析 chunkCount"
 INITIAL_CONTIGUOUS="$(jq -r '.contiguous' "${PROBE_STDOUT}")" || fail "无法解析 contiguous"
 INITIAL_DUPLICATE="$(jq -r '.hasDuplicate' "${PROBE_STDOUT}")" || fail "无法解析 hasDuplicate"
@@ -367,14 +438,16 @@ INITIAL_USER_ID="$(jq -er '.userId' "${PROBE_STDOUT}")" || fail "无法解析 us
 [[ "${INITIAL_CONTIGUOUS}" == "true" ]] || fail "chunk_id 不是连续递增"
 [[ "${INITIAL_DUPLICATE}" == "false" ]] || fail "chunk_id 出现重复"
 [[ "${INITIAL_USER_ID}" == "${USER_ID}" ]] || fail "document_vectors.user_id 与当前用户不一致"
-pass "document_vectors 校验通过: chunkCount=${INITIAL_CHUNK_COUNT}"
+[[ "${INITIAL_ORG_TAG}" == "${RESULT_ORG_TAG}" ]] || fail "document_vectors.org_tag 与阶段七结果不一致"
+[[ "${INITIAL_IS_PUBLIC}" == "${RESULT_IS_PUBLIC}" ]] || fail "document_vectors.is_public 与阶段七结果不一致"
+pass "阶段九 document_vectors 校验通过: chunkCount=${INITIAL_CHUNK_COUNT}"
 
 if [[ "${CHECK_IDEMPOTENCY}" == "1" ]]; then
   consumer_before="$(pattern_count "[Consumer] 文件任务处理成功: MD5=${FILE_MD5}")"
   write_before="$(pattern_count "[Processor] 批量写入 document_vectors 成功: md5=${FILE_MD5}")"
 
-  log "重放同一条 Kafka 文件任务，验证阶段九幂等性"
-  replay_file_task "${FILE_MD5}" "${FILE_NAME}" "${USER_ID}" "${INITIAL_ORG_TAG}" "${INITIAL_IS_PUBLIC}" "${OBJECT_KEY}" || fail "重放 Kafka 文件任务失败"
+  log "重放同一条 Kafka 文件任务，验证整阶段终态幂等性"
+  replay_file_task "${FILE_MD5}" "${FILE_NAME}" "${USER_ID}" "${RESULT_ORG_TAG}" "${RESULT_IS_PUBLIC}" "${OBJECT_KEY}" || fail "重放 Kafka 文件任务失败"
 
   wait_for_log_count_increment "[Consumer] 文件任务处理成功: MD5=${FILE_MD5}" "${consumer_before}" "重复消息 Consumer 成功日志命中"
   wait_for_log_count_increment "[Processor] 批量写入 document_vectors 成功: md5=${FILE_MD5}" "${write_before}" "重复消息 document_vectors 写入日志命中"
@@ -406,5 +479,5 @@ if [[ "${CHECK_IDEMPOTENCY}" == "1" ]]; then
 fi
 
 printf '\n'
-pass "阶段九验收完成: 文本分块、document_vectors 落库、重复消息幂等性均通过"
-log "file=${FILE_NAME} md5=${FILE_MD5} chunkCount=${INITIAL_CHUNK_COUNT}"
+pass "阶段六到阶段九整阶段验收完成"
+log "simpleFile=$(basename "${STAGE6_FILE}") pdfFile=$(basename "${PDF_FILE}") md5=${FILE_MD5} chunkCount=${INITIAL_CHUNK_COUNT}"

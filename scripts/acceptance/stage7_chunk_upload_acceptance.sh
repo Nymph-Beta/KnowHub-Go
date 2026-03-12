@@ -13,11 +13,15 @@ FILE=""
 TOKEN="${TOKEN:-}"
 LOGIN_USERNAME="${LOGIN_USERNAME:-}"
 LOGIN_PASSWORD="${LOGIN_PASSWORD:-}"
+AUTO_REGISTER="${AUTO_REGISTER:-1}"
+AUTO_USER_PREFIX="${AUTO_USER_PREFIX:-stage7_accept}"
+AUTO_PASSWORD="${AUTO_PASSWORD:-Passw0rd!Stage7}"
 ORG_TAG="${ORG_TAG:-}"
 IS_PUBLIC="${IS_PUBLIC:-false}"
 KEEP_TMP=0
 VERBOSE=0
 USE_REAL_MD5=0
+RESULT_JSON_FILE="${RESULT_JSON_FILE:-}"
 
 CHUNK_SIZE=5242880 # 5 * 1024 * 1024
 WORK_DIR="${WORK_DIR:-/tmp/paismart-stage7-acceptance-$$}"
@@ -36,6 +40,10 @@ MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-minioadmin}"
 MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-minioadmin}"
 MINIO_USE_SSL="${MINIO_USE_SSL:-false}"
 MINIO_BUCKET="${MINIO_BUCKET:-uploads}"
+CHECK_STAGE8_PIPELINE_AFTER_MERGE="${CHECK_STAGE8_PIPELINE_AFTER_MERGE:-1}"
+PIPELINE_LOG_FILE="${PIPELINE_LOG_FILE:-${REPO_ROOT}/logs/app.log}"
+PIPELINE_WAIT_SECONDS="${PIPELINE_WAIT_SECONDS:-25}"
+PIPELINE_POLL_MS="${PIPELINE_POLL_MS:-500}"
 
 REQUEST_STATUS=""
 REQUEST_BODY=""
@@ -49,8 +57,8 @@ Options:
   -f <file>       要上传的文件（必填）
   -b <base_url>   服务地址，默认: http://localhost:8081
   -t <token>      直接指定 Bearer token（优先）
-  -u <username>   登录用户名（当未提供 -t 时使用）
-  -p <password>   登录密码（当未提供 -t 时使用）
+  -u <username>   登录用户名（当未提供 -t 时使用；不传则自动注册测试用户）
+  -p <password>   登录密码（与 -u 配套）
   -o <org_tag>    可选 orgTag
   -P              isPublic=true（默认 false）
   -r              使用真实文件 MD5（默认会加随机盐，避免与历史记录冲突）
@@ -74,6 +82,13 @@ Cleanup check envs (optional):
   MINIO_SECRET_KEY=minioadmin
   MINIO_USE_SSL=false
   MINIO_BUCKET=uploads
+  CHECK_STAGE8_PIPELINE_AFTER_MERGE=1
+  PIPELINE_LOG_FILE=./logs/app.log
+  PIPELINE_WAIT_SECONDS=25
+  PIPELINE_POLL_MS=500
+  AUTO_REGISTER=1
+  AUTO_USER_PREFIX=stage7_accept
+  AUTO_PASSWORD=Passw0rd!Stage7
 EOF
 }
 
@@ -153,6 +168,52 @@ md5_text() {
   fi
 }
 
+auto_register_and_login() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    LOGIN_USERNAME="${AUTO_USER_PREFIX}_$(date +%s)_$RANDOM"
+    LOGIN_PASSWORD="${AUTO_PASSWORD}"
+
+    log "未提供凭据，自动注册测试用户: ${LOGIN_USERNAME}"
+    register_payload="$(jq -nc --arg u "${LOGIN_USERNAME}" --arg p "${LOGIN_PASSWORD}" '{username:$u,password:$p}')"
+    request \
+      -X POST "${BASE_URL}/api/v1/users/register" \
+      -H "Content-Type: application/json" \
+      -d "${register_payload}"
+    if [[ "${REQUEST_STATUS}" != "201" ]]; then
+      continue
+    fi
+
+    login_payload="$(jq -nc --arg u "${LOGIN_USERNAME}" --arg p "${LOGIN_PASSWORD}" '{username:$u,password:$p}')"
+    request \
+      -X POST "${BASE_URL}/api/v1/users/login" \
+      -H "Content-Type: application/json" \
+      -d "${login_payload}"
+    assert_status 200 "自动注册后登录失败"
+    TOKEN="$(jq -er '.data.accessToken' <<<"${REQUEST_BODY}")" || fail "自动登录成功但未解析到 accessToken"
+    pass "自动注册并登录成功"
+    return 0
+  done
+
+  fail "自动注册测试用户失败，请改用 -u/-p 或 -t"
+}
+
+wait_for_log_pattern() {
+  local pattern="$1"
+  local desc="$2"
+  local deadline=$(( $(date +%s) + PIPELINE_WAIT_SECONDS ))
+
+  while (( $(date +%s) <= deadline )); do
+    if [[ -f "${PIPELINE_LOG_FILE}" ]] && rg -n --fixed-strings "${pattern}" "${PIPELINE_LOG_FILE}" >/dev/null 2>&1; then
+      pass "${desc}"
+      return 0
+    fi
+    sleep "$(awk "BEGIN { printf \"%.3f\", ${PIPELINE_POLL_MS}/1000 }")"
+  done
+
+  fail "${desc} 超时: 未在 ${PIPELINE_WAIT_SECONDS}s 内匹配日志 pattern=${pattern}"
+}
+
 while getopts ":f:b:t:u:p:o:Prkvh" opt; do
   case "${opt}" in
     f) FILE="${OPTARG}" ;;
@@ -191,6 +252,9 @@ require_cmd awk
 if [[ "${CHECK_CLEANUP}" == "1" ]]; then
   require_cmd go
 fi
+if [[ "${CHECK_STAGE8_PIPELINE_AFTER_MERGE}" == "1" ]]; then
+  require_cmd rg
+fi
 
 mkdir -p "${WORK_DIR}"
 if [[ "${KEEP_TMP}" -eq 0 ]]; then
@@ -200,18 +264,20 @@ fi
 log "工作目录: ${WORK_DIR}"
 
 if [[ -z "${TOKEN}" ]]; then
-  [[ -n "${LOGIN_USERNAME}" && -n "${LOGIN_PASSWORD}" ]] || \
-    fail "未提供 TOKEN，需同时提供 -u <username> 和 -p <password>"
-
-  log "未提供 TOKEN，尝试登录获取 access token"
-  login_payload="$(jq -nc --arg u "${LOGIN_USERNAME}" --arg p "${LOGIN_PASSWORD}" '{username:$u,password:$p}')"
-  request \
-    -X POST "${BASE_URL}/api/v1/users/login" \
-    -H "Content-Type: application/json" \
-    -d "${login_payload}"
-  assert_status 200 "登录接口失败"
-  TOKEN="$(jq -er '.data.accessToken' <<<"${REQUEST_BODY}")" || fail "登录成功但未解析到 accessToken"
-  pass "登录成功并获取 token"
+  if [[ -n "${LOGIN_USERNAME}" && -n "${LOGIN_PASSWORD}" ]]; then
+    log "未提供 TOKEN，尝试登录获取 access token"
+    login_payload="$(jq -nc --arg u "${LOGIN_USERNAME}" --arg p "${LOGIN_PASSWORD}" '{username:$u,password:$p}')"
+    request \
+      -X POST "${BASE_URL}/api/v1/users/login" \
+      -H "Content-Type: application/json" \
+      -d "${login_payload}"
+    assert_status 200 "登录接口失败"
+    TOKEN="$(jq -er '.data.accessToken' <<<"${REQUEST_BODY}")" || fail "登录成功但未解析到 accessToken"
+    pass "登录成功并获取 token"
+  else
+    [[ "${AUTO_REGISTER}" == "1" ]] || fail "未提供 TOKEN/账号密码，且 AUTO_REGISTER=0"
+    auto_register_and_login
+  fi
 fi
 
 # 获取 userID，用于校验 Redis key: upload:{userID}:{fileMD5}
@@ -415,6 +481,37 @@ if [[ "${CHECK_CLEANUP}" == "1" ]]; then
   pass "异步清理校验通过（Redis key 已删除，MinIO 分片已清空）"
 fi
 
+# 9) 端到端闭环：校验 merge 后阶段八异步链路日志（Producer -> Consumer -> Tika）
+if [[ "${CHECK_STAGE8_PIPELINE_AFTER_MERGE}" == "1" ]]; then
+  log "校验阶段八异步链路日志: fileMD5=${FILE_MD5}"
+  wait_for_log_pattern "文件处理任务已投递: md5=${FILE_MD5}" "Producer 投递日志命中"
+  wait_for_log_pattern "[Consumer] 文件任务处理成功: MD5=${FILE_MD5}" "Consumer 成功日志命中"
+  wait_for_log_pattern "[Processor] Tika 提取文本成功: md5=${FILE_MD5}" "Tika 提取成功日志命中"
+fi
+
 printf '\n'
 pass "阶段七验收完成: 全部断言通过"
 log "file=${FILE_NAME} md5=${FILE_MD5} totalChunks=${TOTAL_CHUNKS}"
+
+if [[ -n "${RESULT_JSON_FILE}" ]]; then
+  OBJECT_KEY="uploads/${USER_ID}/${FILE_MD5}/${FILE_NAME}"
+  jq -nc \
+    --arg fileMd5 "${FILE_MD5}" \
+    --arg fileName "${FILE_NAME}" \
+    --argjson userId "${USER_ID}" \
+    --arg orgTag "${ORG_TAG}" \
+    --argjson isPublic "$([[ "${IS_PUBLIC}" == "true" ]] && echo true || echo false)" \
+    --arg objectKey "${OBJECT_KEY}" \
+    --argjson totalChunks "${TOTAL_CHUNKS}" \
+    --argjson totalSize "${TOTAL_SIZE}" \
+    '{
+      fileMd5: $fileMd5,
+      fileName: $fileName,
+      userId: $userId,
+      orgTag: $orgTag,
+      isPublic: $isPublic,
+      objectKey: $objectKey,
+      totalChunks: $totalChunks,
+      totalSize: $totalSize
+    }' > "${RESULT_JSON_FILE}"
+fi
