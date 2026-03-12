@@ -67,6 +67,7 @@ func main() {
 	userRepo := repository.NewUserRepository(database.DB)
 	orgTagRepo := repository.NewOrganizationTagRepository(database.DB)
 	uploadRepo := repository.NewUploadRepository(database.DB, database.RDB)
+	docVectorRepo := repository.NewDocumentVectorRepository(database.DB)
 
 	// 2. JWT Manager
 	jwtManager := token.NewJWTManager(
@@ -167,7 +168,7 @@ func main() {
 	if err != nil {
 		log.Errorf("初始化 Tika 客户端失败，跳过后台文档处理 Consumer: %v", err)
 	} else {
-		processor := pipeline.NewProcessor(tikaClient, storage.MinIOClient, cfg.MinIO.BucketName)
+		processor := pipeline.NewProcessor(tikaClient, storage.MinIOClient, cfg.MinIO.BucketName, docVectorRepo)
 		consumerCtx, cancel := context.WithCancel(context.Background())
 		consumerCancel = cancel
 		go func() {

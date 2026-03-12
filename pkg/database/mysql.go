@@ -43,7 +43,7 @@ func RunMigrate() error {
 		&model.OrganizationTag{}, // 阶段 5
 		&model.FileUpload{},      // 阶段 6: 文件上传记录
 		&model.ChunkInfo{},       // 阶段 7: 分片上传记录
-		// &model.DocumentVector{},  // 阶段 10
+		&model.DocumentVector{},  // 阶段 9: 文本分块结果
 	); err != nil {
 		log.Errorf("Failed to run migrations: %v", err)
 		return err
