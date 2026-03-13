@@ -11,13 +11,15 @@ import (
 var Conf Config
 
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	Log      LogConfig      `mapstructure:"log"`
-	Database DatabaseConfig `mapstructure:"database"`
-	JWT      JWTConfig      `mapstructure:"jwt"`
-	MinIO    MinIOConfig    `mapstructure:"minio"`
-	Kafka    KafkaConfig    `mapstructure:"kafka"`
-	Tika     TikaConfig     `mapstructure:"tika"`
+	Server        ServerConfig        `mapstructure:"server"`
+	Log           LogConfig           `mapstructure:"log"`
+	Database      DatabaseConfig      `mapstructure:"database"`
+	JWT           JWTConfig           `mapstructure:"jwt"`
+	MinIO         MinIOConfig         `mapstructure:"minio"`
+	Kafka         KafkaConfig         `mapstructure:"kafka"`
+	Tika          TikaConfig          `mapstructure:"tika"`
+	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
+	Embedding     EmbeddingConfig     `mapstructure:"embedding"`
 }
 
 // ServerConfig 存储服务器相关的配置。
@@ -77,6 +79,25 @@ type KafkaConfig struct {
 
 type TikaConfig struct {
 	BaseURL        string `mapstructure:"base_url"`
+	TimeoutSeconds int    `mapstructure:"timeout_seconds"`
+}
+
+type ElasticsearchConfig struct {
+	Addresses      []string `mapstructure:"addresses"`
+	Username       string   `mapstructure:"username"`
+	Password       string   `mapstructure:"password"`
+	IndexName      string   `mapstructure:"index_name"`
+	VectorDims     int      `mapstructure:"vector_dims"`
+	Analyzer       string   `mapstructure:"analyzer"`
+	SearchAnalyzer string   `mapstructure:"search_analyzer"`
+	RefreshOnWrite bool     `mapstructure:"refresh_on_write"`
+}
+
+type EmbeddingConfig struct {
+	APIKey         string `mapstructure:"api_key"`
+	BaseURL        string `mapstructure:"base_url"`
+	Model          string `mapstructure:"model"`
+	Dimensions     int    `mapstructure:"dimensions"`
 	TimeoutSeconds int    `mapstructure:"timeout_seconds"`
 }
 

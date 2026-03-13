@@ -11,6 +11,8 @@ import (
 	"pai_smart_go_v2/internal/repository"
 	"pai_smart_go_v2/internal/service"
 	"pai_smart_go_v2/pkg/database"
+	"pai_smart_go_v2/pkg/embedding"
+	"pai_smart_go_v2/pkg/es"
 	"pai_smart_go_v2/pkg/kafka"
 	"pai_smart_go_v2/pkg/log"
 	"pai_smart_go_v2/pkg/storage"
@@ -28,7 +30,6 @@ import (
 
 func main() {
 	config.Init("configs/config.yaml")
-	fmt.Println(config.Conf)
 	cfg := config.Conf
 
 	log.Init(cfg.Log.Level, cfg.Log.Format, cfg.Log.OutputPath)
@@ -168,15 +169,35 @@ func main() {
 	if err != nil {
 		log.Errorf("初始化 Tika 客户端失败，跳过后台文档处理 Consumer: %v", err)
 	} else {
-		processor := pipeline.NewProcessor(tikaClient, storage.MinIOClient, cfg.MinIO.BucketName, docVectorRepo)
-		consumerCtx, cancel := context.WithCancel(context.Background())
-		consumerCancel = cancel
-		go func() {
-			retryStore := kafka.NewRedisRetryStore(database.RDB)
-			if consumeErr := kafka.StartConsumer(consumerCtx, cfg.Kafka, retryStore, processor); consumeErr != nil {
-				log.Errorf("Kafka Consumer 退出: %v", consumeErr)
+		embeddingClient, embedErr := embedding.NewClient(cfg.Embedding)
+		if embedErr != nil {
+			log.Errorf("初始化 Embedding 客户端失败，跳过后台文档处理 Consumer: %v", embedErr)
+		} else {
+			esClient, esErr := es.NewClient(cfg.Elasticsearch)
+			if esErr != nil {
+				log.Errorf("初始化 Elasticsearch 客户端失败，跳过后台文档处理 Consumer: %v", esErr)
+			} else if ensureErr := esClient.EnsureIndex(context.Background()); ensureErr != nil {
+				log.Errorf("初始化 Elasticsearch 索引失败，跳过后台文档处理 Consumer: %v", ensureErr)
+			} else {
+				processor := pipeline.NewProcessor(
+					tikaClient,
+					storage.MinIOClient,
+					cfg.MinIO.BucketName,
+					docVectorRepo,
+					embeddingClient,
+					esClient,
+					cfg.Embedding,
+				)
+				consumerCtx, cancel := context.WithCancel(context.Background())
+				consumerCancel = cancel
+				go func() {
+					retryStore := kafka.NewRedisRetryStore(database.RDB)
+					if consumeErr := kafka.StartConsumer(consumerCtx, cfg.Kafka, retryStore, processor); consumeErr != nil {
+						log.Errorf("Kafka Consumer 退出: %v", consumeErr)
+					}
+				}()
 			}
-		}()
+		}
 	}
 
 	// 启动 HTTP 服务器并实现优雅停机
