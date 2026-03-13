@@ -6,6 +6,7 @@ STAGE6_SCRIPT="${SCRIPT_DIR}/stage6_simple_upload_acceptance.sh"
 STAGE7_SCRIPT="${SCRIPT_DIR}/stage7_chunk_upload_acceptance.sh"
 STAGE6_TO_9_SCRIPT="${SCRIPT_DIR}/stage6_to_9_acceptance.sh"
 STAGE10_SCRIPT="${SCRIPT_DIR}/stage10_acceptance.sh"
+STAGE11_SCRIPT="${SCRIPT_DIR}/stage11_acceptance.sh"
 
 STAGE=""
 STAGE6_FILE=""
@@ -22,10 +23,10 @@ VERBOSE=0
 usage() {
   cat <<'EOF'
 Usage:
-  run_acceptance.sh -s <6|7|6-9|10|all> [options]
+  run_acceptance.sh -s <6|7|6-9|10|11|all> [options]
 
 Options:
-  -s <stage>       指定阶段：6 | 7 | 6-9 | 10 | all（必填）
+  -s <stage>       指定阶段：6 | 7 | 6-9 | 10 | 11 | all（必填）
   --stage6-file    阶段六验收文件（可选，不传则自动生成）
   --stage7-file    阶段七验收文件；对 6-9/all 会作为共享 PDF 覆盖默认 test_data
   -b <base_url>    服务地址（透传给子脚本）
@@ -43,6 +44,7 @@ Examples:
   ./scripts/acceptance/run_acceptance.sh -s 6-9 -u test -p 123456
   ./scripts/acceptance/run_acceptance.sh -s 6-9 --stage7-file ./scripts/test_data/Hashimoto.pdf -u test -p 123456
   ./scripts/acceptance/run_acceptance.sh -s 10 --stage7-file ./scripts/test_data/Hashimoto.pdf -u test -p 123456
+  ./scripts/acceptance/run_acceptance.sh -s 11 --stage7-file ./scripts/test_data/Hashimoto.pdf -u test -p 123456
   ./scripts/acceptance/run_acceptance.sh -s all --stage7-file ./scripts/test_data/Hashimoto.pdf -u test -p 123456
 EOF
 }
@@ -134,6 +136,7 @@ done
 [[ -x "${STAGE7_SCRIPT}" ]] || fail "缺少脚本: ${STAGE7_SCRIPT}"
 [[ -x "${STAGE6_TO_9_SCRIPT}" ]] || fail "缺少脚本: ${STAGE6_TO_9_SCRIPT}"
 [[ -x "${STAGE10_SCRIPT}" ]] || fail "缺少脚本: ${STAGE10_SCRIPT}"
+[[ -x "${STAGE11_SCRIPT}" ]] || fail "缺少脚本: ${STAGE11_SCRIPT}"
 
 build_common_args
 
@@ -169,6 +172,14 @@ run_stage10() {
   "${STAGE10_SCRIPT}" "${args[@]}"
 }
 
+run_stage11() {
+  local args=("${COMMON_ARGS[@]}")
+  if [[ -n "${STAGE7_FILE}" ]]; then
+    args+=(--stage7-file "${STAGE7_FILE}")
+  fi
+  "${STAGE11_SCRIPT}" "${args[@]}"
+}
+
 case "${STAGE}" in
   6)
     run_stage6
@@ -182,10 +193,13 @@ case "${STAGE}" in
   10)
     run_stage10
     ;;
+  11)
+    run_stage11
+    ;;
   all)
-    run_stage10
+    run_stage11
     ;;
   *)
-    fail "无效 stage: ${STAGE}（仅支持 6 | 7 | 6-9 | 10 | all）"
+    fail "无效 stage: ${STAGE}（仅支持 6 | 7 | 6-9 | 10 | 11 | all）"
     ;;
 esac

@@ -15,6 +15,7 @@ CHECK_DOCKER=1
 CHECK_IDEMPOTENCY="${CHECK_IDEMPOTENCY:-1}"
 KEEP_TMP=0
 VERBOSE=0
+RESULT_JSON_FILE="${RESULT_JSON_FILE:-}"
 
 DOCKER_CONTAINERS="${DOCKER_CONTAINERS:-mysql paismart-v2-redis paismart-v2-minio paismart-v2-zookeeper paismart-v2-kafka paismart-v2-tika elasticsearch}"
 MYSQL_DSN="${MYSQL_DSN:-root:PaiSmart2025@tcp(127.0.0.1:3307)/paismart_v2?parseTime=True}"
@@ -376,6 +377,11 @@ RESULT_ORG_TAG="$(jq -er '.orgTag' "${STAGE69_RESULT_JSON}")" || fail "无法解
 RESULT_IS_PUBLIC="$(jq -r '.isPublic' "${STAGE69_RESULT_JSON}")" || fail "无法解析 isPublic"
 OBJECT_KEY="$(jq -er '.objectKey' "${STAGE69_RESULT_JSON}")" || fail "无法解析 objectKey"
 CHUNK_COUNT="$(jq -er '.chunkCount' "${STAGE69_RESULT_JSON}")" || fail "无法解析 chunkCount"
+
+if [[ -n "${RESULT_JSON_FILE}" ]]; then
+  mkdir -p "$(dirname "${RESULT_JSON_FILE}")"
+  cp "${STAGE69_RESULT_JSON}" "${RESULT_JSON_FILE}"
+fi
 
 wait_for_log_pattern "[Processor] Embedding 生成成功: md5=${FILE_MD5}" "阶段十 Embedding 成功日志命中"
 wait_for_log_pattern "[Processor] Elasticsearch 索引成功: md5=${FILE_MD5}" "阶段十 Elasticsearch 索引成功日志命中"
