@@ -1274,3 +1274,239 @@ mysql> SELECT file_md5, chunk_id, LEFT(text_content, 50)
 ```
 
 到这里，阶段九已经把阶段八的"抽文本"推进成了"抽文本并沉淀 chunk"，阶段十就可以在这个结果集上继续做 embedding 和向量索引，而不必再回头处理原始长文本。
+
+## 阶段十 Elasticsearch & Embedding 集成
+
+阶段十的目标，是把阶段九已经稳定落库的 chunk 继续推进成“可检索的向量文档”：
+
+```text
+Kafka 消息
+  -> Processor 下载对象
+  -> Tika 提取文本
+  -> 分块并写入 MySQL(document_vectors)
+  -> 从 MySQL 读回刚写入的 chunk
+  -> 调用 Embedding API 生成向量
+  -> 构建 EsDocument
+  -> 批量写入 Elasticsearch
+```
+
+这一阶段真正引入了第二个存储系统。`document_vectors` 继续作为事实源，负责沉淀 chunk 原文和权限元数据；Elasticsearch 只承担检索引擎角色，负责存放向量、文本和过滤字段。这样即使 ES 索引损坏、mapping 需要重建，系统也不需要重新走一遍 MinIO 下载和 Tika 提取，只需要从 MySQL 重放即可。
+
+---
+
+### 1. 配置扩展与 ES 文档模型
+
+更新：
+
+- `internal/config/config.go`
+- `configs/config.yaml`
+- `internal/model/es_document.go`
+
+新增配置：
+
+- `embedding.api_key / base_url / model / dimensions / timeout_seconds`
+- `elasticsearch.addresses / index_name / vector_dims / analyzer / search_analyzer / refresh_on_write`
+
+对应新增 `EsDocument`：
+
+```go
+type EsDocument struct {
+    VectorID     string
+    FileMD5      string
+    ChunkID      int
+    TextContent  string
+    Vector       []float32
+    ModelVersion string
+    UserID       uint
+    OrgTag       string
+    IsPublic     bool
+}
+```
+
+`VectorID` 固定为 `{file_md5}_{chunk_id}`。这个设计延续了阶段九对 `chunk_id` 的重视：MySQL 中用 `file_md5 + chunk_id` 表示文档内部稳定顺序，ES 中则进一步把它提升为文档主键。这样重复消费同一 Kafka 消息时，同一个 chunk 在 ES 中会被覆盖而不是累积，幂等语义才真正贯穿到外部索引层。
+
+这里还做了一个刻意的工程取舍：`analyzer` 默认配置为 `standard`，而不是直接写死 `ik_max_word`。原因并不是否定 IK 对中文检索的价值，而是当前仓库还没有配套的 ES Dockerfile 或插件安装流程；如果把 mapping 硬编码成 IK，阶段十在很多本地环境中会卡在“索引建不起来”这一非核心问题上。因此实现保留了 analyzer 的可配置能力，安装好 IK 后只需把配置改为 `ik_max_word / ik_smart` 即可，不必再改代码。
+
+---
+
+### 2. Embedding 客户端
+
+新增：`pkg/embedding/client.go`
+
+`Embedding` 侧采用接口抽象：
+
+```go
+type Client interface {
+    CreateEmbedding(ctx context.Context, text string) ([]float32, error)
+}
+```
+
+具体实现使用 DashScope 的兼容 OpenAI `/embeddings` 接口，负责：
+
+- 发送 `Authorization: Bearer {api_key}`
+- 传递 `model` 与 `dimensions`
+- 处理非 200 响应
+- 校验空向量响应
+- 校验返回维度与配置一致
+
+这一层显式把“维度一致性”收紧到了客户端内，而不是等到 ES 索引时报错。原因在于，一旦维度不一致，错误本质上属于“模型配置与存储契约不匹配”，越早失败，问题定位越直接；如果等到 bulk 写 ES 才看到 `dense_vector dims mismatch`，排查成本会更高。
+
+---
+
+### 3. Elasticsearch 客户端
+
+新增：`pkg/es/client.go`
+
+ES 客户端使用官方 `github.com/elastic/go-elasticsearch/v8`，提供三个核心能力：
+
+- `EnsureIndex(ctx)`：检查索引是否存在，不存在则创建
+- `BulkIndexDocuments(ctx, docs)`：批量写入 `EsDocument`
+- `IndexName()`：暴露索引名给上层日志使用
+
+索引 mapping 关键字段：
+
+- `text_content`：`text`
+- `vector`：`dense_vector`
+- `model_version / file_md5 / org_tag / vector_id`：`keyword`
+- `user_id`：`long`
+- `is_public`：`boolean`
+
+批量写入使用 `_bulk`，每个文档通过 `_id = vector_id` 写入。相比逐条 `IndexDocument`，bulk 更符合阶段十的目标：文档一旦被切成十几到几十个 chunk，再逐条发请求会放大网络往返和 refresh 成本。这里虽然还没有进一步做 embedding 批量化，但至少先把 ES 写入合并到了单次 bulk 请求中。
+
+`refresh_on_write` 也被保留成了配置项。开发阶段默认开着，可以让 `curl _search` 立即看到刚写入的文档；如果后续进入更高吞吐的环境，再关闭即可，避免每次索引都触发 refresh。
+
+---
+
+### 4. Processor 扩展：从“写 chunk”到“写向量索引”
+
+更新：`internal/pipeline/processor.go`
+
+`Processor` 的依赖现在变为：
+
+```go
+type Processor struct {
+    tikaClient    *tika.Client
+    minioClient   *minio.Client
+    bucketName    string
+    docVectorRepo repository.DocumentVectorRepository
+    embedding     embedding.Client
+    esClient      es.Client
+    embeddingCfg  config.EmbeddingConfig
+}
+```
+
+`Process` 的后半段新增流程：
+
+1. 阶段九逻辑照旧：抽文本、分块、删旧记录、批量写入 `document_vectors`
+2. 用 `FindByFileMD5` 读回刚写入的 chunk
+3. 遍历 chunk 调 `embedding.CreateEmbedding`
+4. 把结果映射成 `EsDocument`
+5. 调 `esClient.BulkIndexDocuments`
+6. 输出 embedding 成功、ES 索引成功、整文件处理完成日志
+
+这里依然坚持“先落 MySQL，再做向量化”。看起来比“直接对内存里的 chunk 生成向量并写 ES”多了一次查询，但这一步实际上在把系统边界进一步稳定下来：只要 `document_vectors` 写成功，后半段即使失败，系统也保留了可重试的中间态。
+
+同样基于这个考虑，`buildDocumentVectors` 现在会直接把 `embeddingCfg.Model` 写入 `model_version`。阶段九里该字段留空，是因为还没有真正发生向量化；到了阶段十，如果仍然让 `model_version` 为空，就等于只把“文本结果”落了库，却没有把“这批文本将对应哪个语义空间”这个关键信息保存下来。把模型名在 chunk 入库时一并写入，可以让 MySQL 与 ES 在模型版本上保持同一份语义标签。
+
+幂等性在这一阶段继续成立：
+
+- MySQL 侧：`DeleteByFileMD5 + BatchCreate`
+- ES 侧：同一 chunk 使用同一 `vector_id` 覆盖写
+- Kafka 侧：任意中途失败直接 `return error`，让 consumer 走现有重试策略
+
+因此，即使 20 个 chunk 中第 13 个向量化失败，前 12 个已经写入 ES 的文档也不会在重试后产生重复，它们只会被新的同 ID 文档覆盖。
+
+---
+
+### 5. main.go 接线与启动策略
+
+更新：`cmd/server/main.go`
+
+启动阶段新增：
+
+1. 初始化 Embedding 客户端
+2. 初始化 Elasticsearch 客户端
+3. `EnsureIndex()` 确保索引存在
+4. 把 `embeddingClient / esClient / embeddingCfg` 注入 `Processor`
+
+这里沿用了阶段八对 Tika 的容错策略：这些依赖都只服务于后台文档处理链路，不应阻断 HTTP 主服务启动。因此实现采用“初始化失败则跳过 Consumer，但 API 服务照常启动”的策略，而不是把 ES 或 DashScope 失败升级为整个进程 fatal。
+
+这一步还顺手移除了启动时 `fmt.Println(config.Conf)` 的行为。阶段十新增了 `embedding.api_key` 后，这种无差别打印配置的做法会直接把密钥打到标准输出，风险已经从“日志噪音”上升为“敏感信息泄露”，因此这里直接收掉。
+
+---
+
+### 6. 测试补充
+
+新增/扩展测试：
+
+- `pkg/embedding/client_test.go`
+  - 请求头与请求体校验
+  - 维度不匹配错误
+- `pkg/es/client_test.go`
+  - 缺失索引时自动创建
+  - bulk 请求体构造
+  - mapping 默认 analyzer 逻辑
+- `internal/pipeline/processor_test.go`
+  - `buildDocumentVectors` 写入 `model_version`
+  - `buildEsDocument`
+  - `vectorizeDocuments` 成功与失败路径
+
+这里测试没有使用 `httptest.NewServer()`，而是改为自定义 `RoundTripper` 驱动 HTTP 客户端。原因不是业务需求，而是当前沙箱环境禁止测试进程监听本地端口；如果继续依赖 `httptest`，测试会因为环境限制而失败。通过 `RoundTripper` 直接模拟响应，可以覆盖同样的协议逻辑，同时保持测试可在当前仓库环境下稳定执行。
+
+本地回归结果：
+
+```bash
+env GOTOOLCHAIN=local GOCACHE=$(pwd)/.tmp/gocache \
+  /home/yyy/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.11.linux-amd64/bin/go test ./...
+```
+
+结果：全仓 `go test ./...` 通过。
+
+---
+
+### 7. 本阶段更新文件
+
+| 操作 | 文件 |
+| --- | --- |
+| 新增 | `internal/model/es_document.go` — ES 检索文档模型 |
+| 新增 | `pkg/embedding/client.go` — DashScope Embedding 客户端 |
+| 新增 | `pkg/embedding/client_test.go` — Embedding 客户端测试 |
+| 新增 | `pkg/es/client.go` — Elasticsearch 客户端 |
+| 新增 | `pkg/es/client_test.go` — ES 客户端测试 |
+| 更新 | `internal/config/config.go` — 新增 ES / Embedding 配置 |
+| 更新 | `configs/config.yaml` — 增加阶段十配置项 |
+| 更新 | `internal/pipeline/processor.go` — 增加向量化与 ES 索引流程 |
+| 更新 | `internal/pipeline/processor_test.go` — 增加阶段十辅助逻辑测试 |
+| 更新 | `cmd/server/main.go` — 初始化 ES/Embedding 并注入 Processor |
+| 更新 | `go.mod` / `go.sum` — 增加 ES 客户端依赖 |
+
+---
+
+### 8. 验收方式
+
+```bash
+# 1) 配置 DashScope API Key，并确保 Elasticsearch 已启动
+
+# 2) 上传一个可被 Tika 提取正文的文档
+curl -X POST http://localhost:8081/api/v1/upload/simple \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@sample.pdf"
+
+# 3) 观察日志
+# [Processor] Tika 提取文本成功: md5=..., textLength=...
+# [Processor] 文本分块完成: md5=..., chunks=...
+# [Processor] 批量写入 document_vectors 成功: md5=...
+# [Processor] Embedding 生成成功: md5=..., chunks=..., dims=2048, model=text-embedding-v4
+# [Processor] Elasticsearch 索引成功: md5=..., docs=..., index=knowledge_base
+# [Processor] 文件处理成功完成: md5=...
+
+# 4) Elasticsearch 验证
+curl 'http://localhost:9200/knowledge_base/_search?size=1'
+```
+
+如果后续环境已经安装 IK 插件，可直接把：
+
+- `elasticsearch.analyzer` 改为 `ik_max_word`
+- `elasticsearch.search_analyzer` 改为 `ik_smart`
+
+这样阶段十就完成了“从 chunk 到向量索引”的闭环，阶段十一就可以在这个基础上继续实现 KNN + BM25 的混合检索，而不必再回头处理文档解析和索引写入问题。
