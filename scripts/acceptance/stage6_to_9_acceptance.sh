@@ -19,6 +19,7 @@ CHECK_DOCKER=1
 CHECK_IDEMPOTENCY="${CHECK_IDEMPOTENCY:-1}"
 KEEP_TMP=0
 VERBOSE=0
+RESULT_JSON_FILE="${RESULT_JSON_FILE:-}"
 
 DOCKER_CONTAINERS="${DOCKER_CONTAINERS:-mysql paismart-v2-redis paismart-v2-minio paismart-v2-zookeeper paismart-v2-kafka paismart-v2-tika}"
 MYSQL_DSN="${MYSQL_DSN:-root:PaiSmart2025@tcp(127.0.0.1:3307)/paismart_v2?parseTime=True}"
@@ -481,3 +482,25 @@ fi
 printf '\n'
 pass "阶段六到阶段九整阶段验收完成"
 log "simpleFile=$(basename "${STAGE6_FILE}") pdfFile=$(basename "${PDF_FILE}") md5=${FILE_MD5} chunkCount=${INITIAL_CHUNK_COUNT}"
+
+if [[ -n "${RESULT_JSON_FILE}" ]]; then
+  jq -nc \
+    --arg fileMd5 "${FILE_MD5}" \
+    --arg fileName "${FILE_NAME}" \
+    --argjson userId "${USER_ID}" \
+    --arg orgTag "${INITIAL_ORG_TAG}" \
+    --argjson isPublic "$([[ "${INITIAL_IS_PUBLIC}" == "true" ]] && echo true || echo false)" \
+    --arg objectKey "${OBJECT_KEY}" \
+    --argjson chunkCount "${INITIAL_CHUNK_COUNT}" \
+    --arg signature "${INITIAL_SIGNATURE}" \
+    '{
+      fileMd5: $fileMd5,
+      fileName: $fileName,
+      userId: $userId,
+      orgTag: $orgTag,
+      isPublic: $isPublic,
+      objectKey: $objectKey,
+      chunkCount: $chunkCount,
+      signature: $signature
+    }' > "${RESULT_JSON_FILE}"
+fi

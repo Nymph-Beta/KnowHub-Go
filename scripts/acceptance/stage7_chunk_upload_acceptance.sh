@@ -286,6 +286,7 @@ request \
   -H "Authorization: Bearer ${TOKEN}"
 assert_status 200 "获取当前用户信息失败"
 USER_ID="$(jq -er '.data.id' <<<"${REQUEST_BODY}")" || fail "无法从 /users/me 响应解析 userID"
+USER_PRIMARY_ORG="$(jq -er '.data.primaryOrg' <<<"${REQUEST_BODY}")" || fail "无法从 /users/me 响应解析 primaryOrg"
 pass "当前用户 ID: ${USER_ID}"
 
 FILE_NAME="$(basename "${FILE}")"
@@ -494,12 +495,16 @@ pass "阶段七验收完成: 全部断言通过"
 log "file=${FILE_NAME} md5=${FILE_MD5} totalChunks=${TOTAL_CHUNKS}"
 
 if [[ -n "${RESULT_JSON_FILE}" ]]; then
+  EFFECTIVE_ORG_TAG="${ORG_TAG}"
+  if [[ -z "${EFFECTIVE_ORG_TAG}" ]]; then
+    EFFECTIVE_ORG_TAG="${USER_PRIMARY_ORG}"
+  fi
   OBJECT_KEY="uploads/${USER_ID}/${FILE_MD5}/${FILE_NAME}"
   jq -nc \
     --arg fileMd5 "${FILE_MD5}" \
     --arg fileName "${FILE_NAME}" \
     --argjson userId "${USER_ID}" \
-    --arg orgTag "${ORG_TAG}" \
+    --arg orgTag "${EFFECTIVE_ORG_TAG}" \
     --argjson isPublic "$([[ "${IS_PUBLIC}" == "true" ]] && echo true || echo false)" \
     --arg objectKey "${OBJECT_KEY}" \
     --argjson totalChunks "${TOTAL_CHUNKS}" \
