@@ -15,6 +15,7 @@ type UploadRepository interface {
 	// --- GORM: FileUpload ---
 	Create(upload *model.FileUpload) error
 	FindByFileMD5AndUserID(fileMD5 string, userID uint) (*model.FileUpload, error)
+	FindBatchByMD5s(fileMD5s []string) ([]model.FileUpload, error)
 	FindByID(id uint) (*model.FileUpload, error)
 	UpdateFileUploadStatus(fileMD5 string, userID uint, status int, mergedAt *time.Time) error
 
@@ -57,6 +58,18 @@ func (r *uploadRepository) FindByFileMD5AndUserID(fileMD5 string, userID uint) (
 		return nil, err
 	}
 	return &upload, nil
+}
+
+func (r *uploadRepository) FindBatchByMD5s(fileMD5s []string) ([]model.FileUpload, error) {
+	if len(fileMD5s) == 0 {
+		return []model.FileUpload{}, nil
+	}
+
+	var uploads []model.FileUpload
+	if err := r.db.Where("file_md5 IN ?", fileMD5s).Find(&uploads).Error; err != nil {
+		return nil, err
+	}
+	return uploads, nil
 }
 
 func (r *uploadRepository) FindByID(id uint) (*model.FileUpload, error) {

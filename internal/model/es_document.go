@@ -15,6 +15,18 @@ type EsDocument struct {
 	IsPublic     bool      `json:"is_public"`
 }
 
+// SearchResponseDTO 表示返回给前端的检索结果。
+type SearchResponseDTO struct {
+	FileMD5     string  `json:"fileMd5"`
+	FileName    string  `json:"fileName"`
+	ChunkID     int     `json:"chunkId"`
+	TextContent string  `json:"textContent"`
+	Score       float64 `json:"score"`
+	UserID      uint    `json:"userId"`
+	OrgTag      string  `json:"orgTag"`
+	IsPublic    bool    `json:"isPublic"`
+}
+
 func BuildVectorID(fileMD5 string, chunkID int) string {
 	return fmt.Sprintf("%s_%d", fileMD5, chunkID)
 }

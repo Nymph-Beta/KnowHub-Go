@@ -87,11 +87,30 @@ func main() {
 		cfg.MinIO.BucketName,
 		kafka.NewProducerClient(),
 	)
+	var embeddingClient embedding.Client
+	var esClient es.Client
+	var searchService service.SearchService
+	var err error
+
+	embeddingClient, err = embedding.NewClient(cfg.Embedding)
+	if err != nil {
+		log.Errorf("初始化 Embedding 客户端失败，搜索与后台文档处理将不可用: %v", err)
+	} else {
+		esClient, err = es.NewClient(cfg.Elasticsearch)
+		if err != nil {
+			log.Errorf("初始化 Elasticsearch 客户端失败，搜索与后台文档处理将不可用: %v", err)
+		} else if ensureErr := esClient.EnsureIndex(context.Background()); ensureErr != nil {
+			log.Errorf("初始化 Elasticsearch 索引失败，搜索与后台文档处理将不可用: %v", ensureErr)
+			esClient = nil
+		}
+	}
+	searchService = service.NewSearchService(embeddingClient, esClient, userService, uploadRepo)
 
 	// 4. Handler (注入 Service)
 	userHandler := handler.NewUserHandler(userService)
 	orgTagHandler := handler.NewOrgTagHandler(orgTagService)
 	uploadHandler := handler.NewUploadHandler(uploadService)
+	searchHandler := handler.NewSearchHandler(searchService)
 
 	// 4. 设置 Gin 模式
 	gin.SetMode(cfg.Server.Mode)
@@ -124,6 +143,7 @@ func main() {
 		upload.POST("/upload/check", uploadHandler.CheckFile)
 		upload.POST("/upload/chunk", uploadHandler.UploadChunk)
 		upload.POST("/upload/merge", uploadHandler.MergeChunks)
+		upload.GET("/search/hybrid", searchHandler.HybridSearch)
 	}
 
 	// 管理员路由：先过认证，再做管理员鉴权
@@ -168,36 +188,26 @@ func main() {
 	tikaClient, err := tika.NewClient(cfg.Tika)
 	if err != nil {
 		log.Errorf("初始化 Tika 客户端失败，跳过后台文档处理 Consumer: %v", err)
+	} else if embeddingClient == nil || esClient == nil {
+		log.Errorf("Embedding/Elasticsearch 未就绪，跳过后台文档处理 Consumer")
 	} else {
-		embeddingClient, embedErr := embedding.NewClient(cfg.Embedding)
-		if embedErr != nil {
-			log.Errorf("初始化 Embedding 客户端失败，跳过后台文档处理 Consumer: %v", embedErr)
-		} else {
-			esClient, esErr := es.NewClient(cfg.Elasticsearch)
-			if esErr != nil {
-				log.Errorf("初始化 Elasticsearch 客户端失败，跳过后台文档处理 Consumer: %v", esErr)
-			} else if ensureErr := esClient.EnsureIndex(context.Background()); ensureErr != nil {
-				log.Errorf("初始化 Elasticsearch 索引失败，跳过后台文档处理 Consumer: %v", ensureErr)
-			} else {
-				processor := pipeline.NewProcessor(
-					tikaClient,
-					storage.MinIOClient,
-					cfg.MinIO.BucketName,
-					docVectorRepo,
-					embeddingClient,
-					esClient,
-					cfg.Embedding,
-				)
-				consumerCtx, cancel := context.WithCancel(context.Background())
-				consumerCancel = cancel
-				go func() {
-					retryStore := kafka.NewRedisRetryStore(database.RDB)
-					if consumeErr := kafka.StartConsumer(consumerCtx, cfg.Kafka, retryStore, processor); consumeErr != nil {
-						log.Errorf("Kafka Consumer 退出: %v", consumeErr)
-					}
-				}()
+		processor := pipeline.NewProcessor(
+			tikaClient,
+			storage.MinIOClient,
+			cfg.MinIO.BucketName,
+			docVectorRepo,
+			embeddingClient,
+			esClient,
+			cfg.Embedding,
+		)
+		consumerCtx, cancel := context.WithCancel(context.Background())
+		consumerCancel = cancel
+		go func() {
+			retryStore := kafka.NewRedisRetryStore(database.RDB)
+			if consumeErr := kafka.StartConsumer(consumerCtx, cfg.Kafka, retryStore, processor); consumeErr != nil {
+				log.Errorf("Kafka Consumer 退出: %v", consumeErr)
 			}
-		}
+		}()
 	}
 
 	// 启动 HTTP 服务器并实现优雅停机

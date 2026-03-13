@@ -24,6 +24,7 @@ const (
 type Client interface {
 	EnsureIndex(ctx context.Context) error
 	BulkIndexDocuments(ctx context.Context, docs []model.EsDocument) error
+	SearchDocuments(ctx context.Context, req SearchRequest) ([]SearchHit, error)
 	IndexName() string
 }
 
@@ -38,6 +39,34 @@ type bulkResponse struct {
 		Status int             `json:"status"`
 		Error  json.RawMessage `json:"error"`
 	} `json:"items"`
+}
+
+type SearchRequest struct {
+	QueryVector        []float32
+	Query              string
+	Phrase             string
+	TopK               int
+	KNNK               int
+	NumCandidates      int
+	RescoreWindow      int
+	QueryWeight        float64
+	RescoreQueryWeight float64
+	UserID             uint
+	OrgTags            []string
+}
+
+type SearchHit struct {
+	Score  float64
+	Source model.EsDocument
+}
+
+type searchResponse struct {
+	Hits struct {
+		Hits []struct {
+			Score  float64          `json:"_score"`
+			Source model.EsDocument `json:"_source"`
+		} `json:"hits"`
+	} `json:"hits"`
 }
 
 func NewClient(cfg config.ElasticsearchConfig) (Client, error) {
@@ -143,6 +172,48 @@ func (c *client) BulkIndexDocuments(ctx context.Context, docs []model.EsDocument
 	return fmt.Errorf("bulk index documents failed with unknown item error")
 }
 
+func (c *client) SearchDocuments(ctx context.Context, req SearchRequest) ([]SearchHit, error) {
+	if len(req.QueryVector) == 0 {
+		return nil, fmt.Errorf("query vector is empty")
+	}
+	if req.TopK <= 0 {
+		return nil, fmt.Errorf("topK must be greater than 0")
+	}
+
+	body, err := json.Marshal(buildSearchBody(req))
+	if err != nil {
+		return nil, fmt.Errorf("marshal search body failed: %w", err)
+	}
+
+	res, err := c.raw.Search(
+		c.raw.Search.WithContext(ctx),
+		c.raw.Search.WithIndex(c.cfg.IndexName),
+		c.raw.Search.WithBody(bytes.NewReader(body)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search documents failed: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		return nil, fmt.Errorf("search documents failed: %s", responseError(res))
+	}
+
+	var parsed searchResponse
+	if err := json.NewDecoder(res.Body).Decode(&parsed); err != nil {
+		return nil, fmt.Errorf("decode search response failed: %w", err)
+	}
+
+	hits := make([]SearchHit, 0, len(parsed.Hits.Hits))
+	for _, hit := range parsed.Hits.Hits {
+		hits = append(hits, SearchHit{
+			Score:  hit.Score,
+			Source: hit.Source,
+		})
+	}
+	return hits, nil
+}
+
 func (c *client) createIndex(ctx context.Context) error {
 	body, err := json.Marshal(buildIndexMapping(c.cfg))
 	if err != nil {
@@ -224,6 +295,138 @@ func buildIndexMapping(cfg config.ElasticsearchConfig) map[string]interface{} {
 			},
 		},
 	}
+}
+
+func buildSearchBody(req SearchRequest) map[string]interface{} {
+	permissionFilter := buildPermissionFilter(req.UserID, req.OrgTags)
+	textShould := buildTextShouldClauses(req.Query, req.Phrase)
+
+	body := map[string]interface{}{
+		"size": req.TopK,
+		"_source": []string{
+			"vector_id",
+			"file_md5",
+			"chunk_id",
+			"text_content",
+			"model_version",
+			"user_id",
+			"org_tag",
+			"is_public",
+		},
+		"knn": map[string]interface{}{
+			"field":          "vector",
+			"query_vector":   req.QueryVector,
+			"k":              positiveOrDefault(req.KNNK, req.TopK),
+			"num_candidates": positiveOrDefault(req.NumCandidates, positiveOrDefault(req.KNNK, req.TopK)),
+			"filter":         permissionFilter,
+		},
+		"query": buildQueryClause(permissionFilter, textShould),
+	}
+
+	if len(textShould) > 0 {
+		body["rescore"] = map[string]interface{}{
+			"window_size": positiveOrDefault(req.RescoreWindow, req.TopK),
+			"query": map[string]interface{}{
+				"query_weight":         positiveFloatOrDefault(req.QueryWeight, 0.35),
+				"rescore_query_weight": positiveFloatOrDefault(req.RescoreQueryWeight, 1.25),
+				"score_mode":           "total",
+				"rescore_query": map[string]interface{}{
+					"bool": map[string]interface{}{
+						"should":               textShould,
+						"minimum_should_match": 1,
+					},
+				},
+			},
+		}
+	}
+
+	return body
+}
+
+func buildPermissionFilter(userID uint, orgTags []string) map[string]interface{} {
+	should := make([]interface{}, 0, 3)
+	should = append(should,
+		map[string]interface{}{"term": map[string]interface{}{"is_public": true}},
+		map[string]interface{}{"term": map[string]interface{}{"user_id": userID}},
+	)
+	if len(orgTags) > 0 {
+		should = append(should, map[string]interface{}{
+			"terms": map[string]interface{}{
+				"org_tag": orgTags,
+			},
+		})
+	}
+
+	return map[string]interface{}{
+		"bool": map[string]interface{}{
+			"should":               should,
+			"minimum_should_match": 1,
+		},
+	}
+}
+
+func buildTextShouldClauses(query string, phrase string) []interface{} {
+	query = strings.TrimSpace(query)
+	phrase = strings.TrimSpace(phrase)
+	if query == "" {
+		return nil
+	}
+
+	should := []interface{}{
+		map[string]interface{}{
+			"match": map[string]interface{}{
+				"text_content": map[string]interface{}{
+					"query": query,
+					"boost": 1.0,
+				},
+			},
+		},
+	}
+	if phrase != "" {
+		should = append(should, map[string]interface{}{
+			"match_phrase": map[string]interface{}{
+				"text_content": map[string]interface{}{
+					"query": phrase,
+					"boost": 2.0,
+				},
+			},
+		})
+	}
+	return should
+}
+
+func buildQueryClause(permissionFilter map[string]interface{}, textShould []interface{}) map[string]interface{} {
+	boolQuery := map[string]interface{}{
+		"filter": []interface{}{permissionFilter},
+	}
+	if len(textShould) > 0 {
+		boolQuery["must"] = []interface{}{
+			map[string]interface{}{
+				"bool": map[string]interface{}{
+					"should":               textShould,
+					"minimum_should_match": 1,
+				},
+			},
+		}
+	}
+
+	return map[string]interface{}{
+		"bool": boolQuery,
+	}
+}
+
+func positiveOrDefault(value int, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+
+func positiveFloatOrDefault(value float64, fallback float64) float64 {
+	if value > 0 {
+		return value
+	}
+	return fallback
 }
 
 func responseError(res *esapi.Response) string {

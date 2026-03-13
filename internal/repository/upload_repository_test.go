@@ -115,6 +115,47 @@ func TestUploadRepository_FindByFileMD5AndUserID(t *testing.T) {
 	}
 }
 
+func TestUploadRepository_FindBatchByMD5s(t *testing.T) {
+	repo, mock := newMockUploadRepo(t, nil)
+
+	rows := sqlmock.NewRows([]string{
+		"id", "file_md5", "file_name", "total_size", "status",
+		"user_id", "org_tag", "is_public", "merged_at", "created_at", "updated_at",
+	}).
+		AddRow(1, "md5-a", "a.pdf", int64(10), 1, uint(2), "team-a", false, nil, time.Now(), time.Now()).
+		AddRow(2, "md5-b", "b.pdf", int64(20), 1, uint(2), "team-b", true, nil, time.Now(), time.Now())
+
+	mock.ExpectQuery("SELECT .* FROM `file_uploads` WHERE file_md5 IN \\(.+\\)").
+		WithArgs("md5-a", "md5-b").
+		WillReturnRows(rows)
+
+	uploads, err := repo.FindBatchByMD5s([]string{"md5-a", "md5-b"})
+	if err != nil {
+		t.Fatalf("FindBatchByMD5s() error: %v", err)
+	}
+	if len(uploads) != 2 || uploads[0].FileMD5 != "md5-a" || uploads[1].FileMD5 != "md5-b" {
+		t.Fatalf("unexpected uploads: %+v", uploads)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestUploadRepository_FindBatchByMD5s_Empty(t *testing.T) {
+	repo, mock := newMockUploadRepo(t, nil)
+
+	uploads, err := repo.FindBatchByMD5s(nil)
+	if err != nil {
+		t.Fatalf("FindBatchByMD5s() error: %v", err)
+	}
+	if len(uploads) != 0 {
+		t.Fatalf("expected empty uploads, got %+v", uploads)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestUploadRepository_FindByID(t *testing.T) {
 	repo, mock := newMockUploadRepo(t, nil)
 

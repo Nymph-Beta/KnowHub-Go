@@ -17,6 +17,7 @@ import (
 type fakeUploadRepo struct {
 	createFn                     func(upload *model.FileUpload) error
 	findByFileMD5AndUserIDFn     func(fileMD5 string, userID uint) (*model.FileUpload, error)
+	findBatchByMD5sFn            func(fileMD5s []string) ([]model.FileUpload, error)
 	findByIDFn                   func(id uint) (*model.FileUpload, error)
 	updateFileUploadStatusFn     func(fileMD5 string, userID uint, status int, mergedAt *time.Time) error
 	createChunkInfoFn            func(chunk *model.ChunkInfo) error
@@ -39,6 +40,13 @@ func (f *fakeUploadRepo) FindByFileMD5AndUserID(fileMD5 string, userID uint) (*m
 		return f.findByFileMD5AndUserIDFn(fileMD5, userID)
 	}
 	return nil, gorm.ErrRecordNotFound
+}
+
+func (f *fakeUploadRepo) FindBatchByMD5s(fileMD5s []string) ([]model.FileUpload, error) {
+	if f.findBatchByMD5sFn != nil {
+		return f.findBatchByMD5sFn(fileMD5s)
+	}
+	return []model.FileUpload{}, nil
 }
 
 func (f *fakeUploadRepo) FindByID(id uint) (*model.FileUpload, error) {
