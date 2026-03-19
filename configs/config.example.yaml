@@ -1,0 +1,82 @@
+server:
+  port: "8081"
+  mode: "debug"
+
+log:
+  level: "debug"
+  format: "json"
+  output_path: "./logs"
+  error_output_path: "./logs/error.log"
+  maxsize: 100
+  maxbackups: 10
+  maxage: 30
+  compress: true
+  time_format: "2006-01-02 15:04:05.000"
+
+database:
+  mysql:
+    dsn: "root:YOUR_MYSQL_PASSWORD@tcp(127.0.0.1:3307)/paismart_v2?parseTime=True"
+  redis:
+    addr: "127.0.0.1:6381"
+    password: "YOUR_REDIS_PASSWORD"
+    db: 1
+
+jwt:
+  secret: "REPLACE_WITH_A_LONG_RANDOM_SECRET"
+  access_token_expire_hours: 24
+  refresh_token_expire_days: 7
+
+minio:
+  endpoint: "127.0.0.1:9302"
+  access_key_id: "YOUR_MINIO_ACCESS_KEY"
+  secret_access_key: "YOUR_MINIO_SECRET_KEY"
+  use_ssl: false
+  bucket_name: "uploads"
+
+kafka:
+  brokers:
+    - "127.0.0.1:9093"
+  topic: "file-processing"
+  group_id: "file-processing-group"
+  max_retry: 3
+  retry_key_ttl_seconds: 86400
+
+tika:
+  base_url: "http://127.0.0.1:9999"
+  timeout_seconds: 10
+
+elasticsearch:
+  addresses:
+    - "http://127.0.0.1:9200"
+  username: "elastic"
+  password: "YOUR_ELASTIC_PASSWORD"
+  index_name: "knowledge_base"
+  vector_dims: 2048
+  analyzer: "standard"
+  search_analyzer: "standard"
+  refresh_on_write: true
+
+embedding:
+  api_key: "YOUR_EMBEDDING_API_KEY"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  model: "text-embedding-v4"
+  dimensions: 2048
+  timeout_seconds: 15
+
+llm:
+  provider: "deepseek"
+  api_style: "openai_compatible"
+  api_key: "YOUR_LLM_API_KEY"
+  base_url: "https://api.deepseek.com/v1"
+  model: "deepseek-chat"
+  timeout_seconds: 120
+  websocket_token_expire_minutes: 5
+  generation:
+    temperature: 0.2
+    top_p: 0.9
+    max_tokens: 1024
+  prompt:
+    template_file: "prompts/chat_rag_system.tmpl"
+    ref_start: "<<REF>>"
+    ref_end: "<<END>>"
+    no_result_text: "当前知识库里没有检索到足够相关的资料，暂时无法给出可靠回答。"

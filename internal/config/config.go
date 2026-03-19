@@ -3,6 +3,9 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -20,6 +23,7 @@ type Config struct {
 	Tika          TikaConfig          `mapstructure:"tika"`
 	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
 	Embedding     EmbeddingConfig     `mapstructure:"embedding"`
+	LLM           LLMConfig           `mapstructure:"llm"`
 }
 
 // ServerConfig 存储服务器相关的配置。
@@ -101,6 +105,33 @@ type EmbeddingConfig struct {
 	TimeoutSeconds int    `mapstructure:"timeout_seconds"`
 }
 
+type LLMConfig struct {
+	Provider                    string              `mapstructure:"provider"`
+	APIStyle                    string              `mapstructure:"api_style"`
+	APIKey                      string              `mapstructure:"api_key"`
+	BaseURL                     string              `mapstructure:"base_url"`
+	Model                       string              `mapstructure:"model"`
+	TimeoutSeconds              int                 `mapstructure:"timeout_seconds"`
+	WebSocketTokenExpireMinutes int                 `mapstructure:"websocket_token_expire_minutes"`
+	Generation                  LLMGenerationConfig `mapstructure:"generation"`
+	Prompt                      LLMPromptConfig     `mapstructure:"prompt"`
+}
+
+type LLMGenerationConfig struct {
+	Temperature float64 `mapstructure:"temperature"`
+	TopP        float64 `mapstructure:"top_p"`
+	MaxTokens   int     `mapstructure:"max_tokens"`
+}
+
+type LLMPromptConfig struct {
+	TemplateFile string `mapstructure:"template_file"`
+	Template     string `mapstructure:"-"`
+	Rules        string `mapstructure:"rules"`
+	RefStart     string `mapstructure:"ref_start"`
+	RefEnd       string `mapstructure:"ref_end"`
+	NoResultText string `mapstructure:"no_result_text"`
+}
+
 // init 初始化配置加载，从指定的路径读取 YAML 配置文件并解析导入到 Conf 变量中
 func Init(configPath string) {
 	viper.SetConfigFile(configPath)
@@ -113,4 +144,30 @@ func Init(configPath string) {
 	if err := viper.Unmarshal(&Conf); err != nil {
 		panic(fmt.Errorf("fatal error unmarshalling config: %w", err))
 	}
+
+	if err := loadPromptTemplate(configPath, &Conf.LLM); err != nil {
+		panic(fmt.Errorf("fatal error loading llm prompt template: %w", err))
+	}
+}
+
+func loadPromptTemplate(configPath string, llmCfg *LLMConfig) error {
+	if llmCfg == nil {
+		return nil
+	}
+
+	templateFile := strings.TrimSpace(llmCfg.Prompt.TemplateFile)
+	if templateFile == "" {
+		return nil
+	}
+
+	if !filepath.IsAbs(templateFile) {
+		templateFile = filepath.Join(filepath.Dir(configPath), templateFile)
+	}
+
+	content, err := os.ReadFile(templateFile)
+	if err != nil {
+		return err
+	}
+	llmCfg.Prompt.Template = string(content)
+	return nil
 }
