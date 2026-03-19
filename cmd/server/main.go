@@ -14,6 +14,7 @@ import (
 	"pai_smart_go_v2/pkg/embedding"
 	"pai_smart_go_v2/pkg/es"
 	"pai_smart_go_v2/pkg/kafka"
+	"pai_smart_go_v2/pkg/llm"
 	"pai_smart_go_v2/pkg/log"
 	"pai_smart_go_v2/pkg/storage"
 	"pai_smart_go_v2/pkg/tika"
@@ -69,6 +70,7 @@ func main() {
 	orgTagRepo := repository.NewOrganizationTagRepository(database.DB)
 	uploadRepo := repository.NewUploadRepository(database.DB, database.RDB)
 	docVectorRepo := repository.NewDocumentVectorRepository(database.DB)
+	conversationRepo := repository.NewConversationRepository(database.RDB)
 
 	// 2. JWT Manager
 	jwtManager := token.NewJWTManager(
@@ -90,6 +92,8 @@ func main() {
 	var embeddingClient embedding.Client
 	var esClient es.Client
 	var searchService service.SearchService
+	var llmClient llm.Client
+	var chatService service.ChatService
 	var err error
 
 	embeddingClient, err = embedding.NewClient(cfg.Embedding)
@@ -105,12 +109,21 @@ func main() {
 		}
 	}
 	searchService = service.NewSearchService(embeddingClient, esClient, userService, uploadRepo)
+	llmClient, err = llm.NewClient(cfg.LLM)
+	if err != nil {
+		log.Errorf("初始化 LLM 客户端失败，聊天功能将不可用: %v", err)
+	} else if embeddingClient == nil || esClient == nil {
+		log.Errorf("检索依赖未就绪，聊天功能将不可用")
+	} else {
+		chatService = service.NewChatService(searchService, llmClient, conversationRepo, cfg.LLM)
+	}
 
 	// 4. Handler (注入 Service)
 	userHandler := handler.NewUserHandler(userService)
 	orgTagHandler := handler.NewOrgTagHandler(orgTagService)
 	uploadHandler := handler.NewUploadHandler(uploadService)
 	searchHandler := handler.NewSearchHandler(searchService)
+	chatHandler := handler.NewChatHandler(chatService, userService, jwtManager, cfg.LLM)
 
 	// 4. 设置 Gin 模式
 	gin.SetMode(cfg.Server.Mode)
@@ -144,7 +157,10 @@ func main() {
 		upload.POST("/upload/chunk", uploadHandler.UploadChunk)
 		upload.POST("/upload/merge", uploadHandler.MergeChunks)
 		upload.GET("/search/hybrid", searchHandler.HybridSearch)
+		upload.GET("/chat/websocket-token", chatHandler.GetWebSocketToken)
 	}
+
+	r.GET("/chat/:token", chatHandler.HandleWebSocket)
 
 	// 管理员路由：先过认证，再做管理员鉴权
 	admin := r.Group("/api/v1/admin")

@@ -12,8 +12,9 @@ import (
 // TokenType 常量，用于区分访问令牌和刷新令牌
 // 防止攻击者拿 refresh token 冒充 access token 来访问 API
 const (
-	TokenTypeAccess  = "access"
-	TokenTypeRefresh = "refresh"
+	TokenTypeAccess    = "access"
+	TokenTypeRefresh   = "refresh"
+	TokenTypeWebSocket = "websocket"
 )
 
 // JWTManager 是 JWT 管理器，负责生成和验证 JWT
@@ -48,60 +49,22 @@ func NewJWTManager(secretKey string, accessTokenDuration, refreshTokenDuration t
 
 // GenerateToken 生成访问令牌和刷新令牌
 func (manager *JWTManager) GenerateToken(userID uint, username, role string) (string, string, error) {
-	// 当前时间
-	now := time.Now()
-	// 访问令牌过期时间
-	exp := now.Add(manager.accessTokenDuration)
-	// 访问令牌 Claims
-	accessClaims := &CustomClaims{
-		UserID:    userID,
-		Username:  username,
-		Role:      role,
-		TokenType: TokenTypeAccess, // 标记为访问令牌，防止与刷新令牌混用
-		// 访问令牌标准 Claims
-		RegisteredClaims: jwt.RegisteredClaims{
-			// 颁发者
-			Issuer: "paismart",
-			// 过期时间
-			ExpiresAt: jwt.NewNumericDate(exp),
-			// 颁发时间
-			IssuedAt: jwt.NewNumericDate(now),
-			// 生效时间
-			NotBefore: jwt.NewNumericDate(now),
-		},
-	}
-	// 创建访问令牌
-	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
-	// 签名访问令牌
-	accessTokenString, err := accessToken.SignedString(manager.secretKey)
+	accessTokenString, err := manager.generateSignedToken(userID, username, role, TokenTypeAccess, manager.accessTokenDuration)
 	if err != nil {
 		return "", "", err
 	}
-	// 刷新令牌 Claims
-	refreshClaims := &CustomClaims{
-		UserID:    userID,
-		Username:  username,
-		Role:      role,
-		TokenType: TokenTypeRefresh, // 标记为刷新令牌，防止与访问令牌混用
-		RegisteredClaims: jwt.RegisteredClaims{
-			// 颁发者
-			Issuer: "paismart",
-			// 过期时间
-			ExpiresAt: jwt.NewNumericDate(now.Add(manager.refreshTokenDuration)),
-			// 颁发时间
-			IssuedAt: jwt.NewNumericDate(now),
-			// 生效时间
-			NotBefore: jwt.NewNumericDate(now),
-		},
-	}
-	// 创建刷新令牌
-	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
-	// 签名刷新令牌
-	refreshTokenString, err := refreshToken.SignedString(manager.secretKey)
+	refreshTokenString, err := manager.generateSignedToken(userID, username, role, TokenTypeRefresh, manager.refreshTokenDuration)
 	if err != nil {
 		return "", "", err
 	}
 	return accessTokenString, refreshTokenString, nil
+}
+
+func (manager *JWTManager) GenerateWebSocketToken(userID uint, username, role string, duration time.Duration) (string, error) {
+	if duration <= 0 {
+		duration = 5 * time.Minute
+	}
+	return manager.generateSignedToken(userID, username, role, TokenTypeWebSocket, duration)
 }
 
 // VerifyToken 验证令牌
@@ -123,6 +86,25 @@ func (manager *JWTManager) VerifyToken(tokenString string) (*CustomClaims, error
 	}
 	// 返回 CustomClaims
 	return token.Claims.(*CustomClaims), nil
+}
+
+func (manager *JWTManager) generateSignedToken(userID uint, username, role, tokenType string, duration time.Duration) (string, error) {
+	now := time.Now()
+	claims := &CustomClaims{
+		UserID:    userID,
+		Username:  username,
+		Role:      role,
+		TokenType: tokenType,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "paismart",
+			ExpiresAt: jwt.NewNumericDate(now.Add(duration)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+		},
+	}
+
+	signed := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return signed.SignedString(manager.secretKey)
 }
 
 // GenerateRandomString 生成随机字符串
