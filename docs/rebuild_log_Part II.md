@@ -1510,3 +1510,238 @@ curl 'http://localhost:9200/knowledge_base/_search?size=1'
 - `elasticsearch.search_analyzer` 改为 `ik_smart`
 
 这样阶段十就完成了“从 chunk 到向量索引”的闭环，阶段十一就可以在这个基础上继续实现 KNN + BM25 的混合检索，而不必再回头处理文档解析和索引写入问题。
+
+## 阶段十一 混合检索实现
+
+阶段十一的目标，是把阶段十已经写入 Elasticsearch 的 chunk 真正变成“可读路径”能力：
+
+```text
+用户查询
+  -> SearchHandler 解析 query/topK
+  -> SearchService 标准化查询
+  -> Embedding 生成查询向量
+  -> Elasticsearch 执行 KNN + BM25 + Rescore
+  -> UploadRepository 回填 file_name
+  -> 返回 SearchResponseDTO
+```
+
+到这里，系统第一次具备了 RAG 中 Retrieval 的完整 HTTP 入口。前十阶段完成的是“文档如何进入系统”，阶段十一开始回答“用户如何把文档再找出来”。
+
+---
+
+### 1. 搜索结果模型与文件名回填
+
+更新：
+
+- `internal/model/es_document.go`
+- `internal/repository/upload_repository.go`
+
+阶段十的 `EsDocument` 只覆盖了 ES 中需要落库的字段，但真正返回给前端的搜索结果还缺两个关键信息：
+
+- `score`：告诉调用方这段 chunk 为什么排在前面
+- `fileName`：让结果能被用户直接识别，而不只是一个 `file_md5`
+
+因此这里补了 `SearchResponseDTO`，并给 `UploadRepository` 新增 `FindBatchByMD5s`。设计上没有把 `file_name` 冗余进 ES，而是继续把 MySQL 视为上传元数据事实源。这样做的原因不是节省一个字段，而是保持职责边界清晰：ES 负责“找出相关 chunk”，MySQL 负责“补齐文件展示信息”。后续即使文件名修改或补录，也不需要重建整批向量索引。
+
+---
+
+### 2. Elasticsearch 客户端扩展：从只写入到可搜索
+
+更新：
+
+- `pkg/es/client.go`
+- `pkg/es/client_test.go`
+
+阶段十的 `es.Client` 只有 `EnsureIndex / BulkIndexDocuments / IndexName`，只能支撑写入链路。阶段十一把它扩展成同时承担检索执行器：
+
+```go
+type Client interface {
+    EnsureIndex(ctx context.Context) error
+    BulkIndexDocuments(ctx context.Context, docs []model.EsDocument) error
+    SearchDocuments(ctx context.Context, req SearchRequest) ([]SearchHit, error)
+    IndexName() string
+}
+```
+
+这里没有让 `SearchService` 直接持有官方 `*elasticsearch.Client`，而是继续把“HTTP 调 ES、拼接 DSL、解析 hits”收敛在 `pkg/es` 内。这样业务层看到的是 `SearchRequest / SearchHit` 这种仓库内自有模型，而不是直接操作原始 JSON 响应，边界更稳定。
+
+`SearchDocuments` 内部构建的请求结构是：
+
+- `knn`：对查询向量做语义召回
+- `query.bool.must`：对标准化后的文本做 BM25 匹配
+- `query.bool.filter`：做 `public / user_id / org_tag` 权限过滤
+- `rescore`：对 BM25 命中再做一次窗口内重排
+
+一个值得注意的实现细节是：权限过滤同时出现在 `knn.filter` 和顶层 `query.filter`。原因在于，KNN 召回和 BM25 查询在 ES 中是两条并行评分路径；如果只在一侧加过滤，另一侧仍可能把无权限文档带进候选集。
+
+---
+
+### 3. SearchService：查询标准化与混合检索编排
+
+新增：`internal/service/search_service.go`
+
+`SearchService` 承担的是阶段十一真正的业务逻辑，而不是简单地“转发 ES 请求”：
+
+1. 校验 `query / topK / user`
+2. 调用 `GetUserEffectiveOrgTags`
+3. 对原始查询执行 `normalizeQuery`
+4. 用原始查询生成 embedding
+5. 调用 `esClient.SearchDocuments`
+6. 批量查 `file_md5 -> file_name`
+7. 组装 `SearchResponseDTO`
+
+这里保留了一个很重要的非对称设计：
+
+- 向量检索使用原始查询
+- BM25 使用标准化后的查询
+
+原因和阶段十一教学指导一致。Embedding 模型本身对“请问”“是什么”这类口语噪音容忍度较高，但 BM25 是词项匹配，噪音词会直接稀释分数。因此 `normalizeQuery` 做的是轻量清洗，而不是强行改写用户意图。
+
+查询标准化具体包含：
+
+- 转小写
+- 移除常见中文口语停用词
+- 只保留中文、英文、数字
+- 把连续空白折叠为单空格
+
+如果标准化后文本为空，当前实现不会直接让检索失败，而是退回到“仅保留合法字符”的宽松版本，尽量保住 KNN 召回能力。
+
+---
+
+### 4. 权限过滤语义：沿用阶段五的“向下展开”
+
+阶段十一真正把前面埋下的权限元数据用起来了。当前仓库在阶段五实现的是“用户持有某个组织标签时，同时拥有其子标签的可见范围”。因此这里搜索权限也保持同一语义：
+
+- `is_public == true`
+- `user_id == 当前用户`
+- `org_tag IN GetUserEffectiveOrgTags(user.ID)`
+
+三者满足任一即可命中。
+
+教学指导里特别提醒了“向上展开还是向下展开”的问题。这里没有临时推翻已有实现，而是选择沿用仓库当前已经建立的组织可见性语义。原因很简单：如果上传、列表、权限判断是一套规则，而搜索突然换成另一套继承方向，系统会在最难排查的地方出现“明明能看见文档，却搜不到”的行为分裂。阶段十一优先保证权限语义一致，后续若要调整继承方向，应整体修改阶段五及相关依赖，而不是只改搜索。
+
+---
+
+### 5. Handler 与主程序接线
+
+新增：
+
+- `internal/handler/search_handler.go`
+- `internal/handler/search_handler_test.go`
+
+更新：
+
+- `cmd/server/main.go`
+
+新接口为：
+
+```text
+GET /api/v1/search/hybrid?query=xxx&topK=10
+Authorization: Bearer <token>
+```
+
+路由注册在 `/api/v1` 认证分组下，因此搜索与上传、下载一样，默认要求登录。`SearchHandler` 只做 HTTP 层翻译：
+
+- 解析 `query` 和 `topK`
+- 从 context 读取当前用户
+- 调用 `SearchService.HybridSearch`
+- 返回统一 JSON 响应
+
+`main.go` 里也做了一个结构性调整：Embedding 客户端和 ES 客户端不再只为后台 `Processor` 初始化，而是被提升为主程序共享依赖，同时服务于“后台索引写入”和“前台在线搜索”。如果 ES 或 Embedding 初始化失败，HTTP 服务仍然启动，但搜索接口会进入不可用状态，后台 Consumer 也会跳过。这延续了阶段十“外部依赖故障不直接拖垮主进程”的策略。
+
+---
+
+### 6. 测试补充
+
+新增/扩展测试：
+
+- `pkg/es/client_test.go`
+  - 混合检索请求体构造
+  - 搜索结果解析
+  - 空文本查询时退化为 filter-only 查询
+- `internal/service/search_service_test.go`
+  - 查询标准化
+  - 混合检索成功路径
+  - embedding 失败路径
+  - `topK` 归一化与 `file_md5` 去重
+- `internal/handler/search_handler_test.go`
+  - 成功响应
+  - 非法 `topK`
+  - service 错误映射
+  - 服务不可用兜底
+- `internal/repository/upload_repository_test.go`
+  - `FindBatchByMD5s`
+- `scripts/acceptance/stage11_acceptance.sh`
+  - 复用阶段十验收，继续验证真实搜索链路
+  - owner 搜索可命中刚写入 ES 的文档
+  - stranger 在私有文档场景下不可命中
+  - 非法 `topK` 返回 400
+
+本地回归结果：
+
+```bash
+env GOCACHE=$(pwd)/.tmp/gocache \
+  /home/yyy/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.11.linux-amd64/bin/go test ./...
+```
+
+结果：全仓 `go test ./...` 通过。
+
+---
+
+### 7. 本阶段更新文件
+
+| 操作 | 文件 |
+| --- | --- |
+| 新增 | `internal/service/search_service.go` — 混合检索业务编排 |
+| 新增 | `internal/service/search_service_test.go` — SearchService 测试 |
+| 新增 | `internal/handler/search_handler.go` — 搜索 HTTP 端点 |
+| 新增 | `internal/handler/search_handler_test.go` — 搜索 Handler 测试 |
+| 更新 | `pkg/es/client.go` — 增加混合检索执行能力 |
+| 更新 | `pkg/es/client_test.go` — 增加搜索请求/响应测试 |
+| 更新 | `internal/model/es_document.go` — 增加 `SearchResponseDTO` |
+| 更新 | `internal/repository/upload_repository.go` — 增加 `FindBatchByMD5s` |
+| 更新 | `internal/repository/upload_repository_test.go` — 增加批量查文件元数据测试 |
+| 更新 | `internal/service/upload_service_test.go` — 补齐仓储 fake 接口 |
+| 更新 | `cmd/server/main.go` — 注册搜索路由并共享 ES / Embedding 依赖 |
+| 更新 | `docs/LEARNING_PATH.md` — 勾选阶段十一任务 |
+| 新增 | `scripts/acceptance/stage11_acceptance.sh` — 阶段十一端到端验收脚本 |
+| 更新 | `scripts/acceptance/stage10_acceptance.sh` — 支持导出阶段十结果供阶段十一复用 |
+| 更新 | `scripts/acceptance/run_acceptance.sh` — 增加阶段十一入口 |
+
+---
+
+### 8. 验收方式
+
+```bash
+# 1) 确保阶段十已经成功把文档写入 Elasticsearch
+
+# 2) 执行混合检索
+curl "http://localhost:8081/api/v1/search/hybrid?query=Go语言并发&topK=5" \
+  -H "Authorization: Bearer $TOKEN"
+
+# 3) 预期响应
+{
+  "code": 200,
+  "message": "Search successful",
+  "data": [
+    {
+      "fileMd5": "abc123",
+      "fileName": "go_tutorial.pdf",
+      "chunkId": 3,
+      "textContent": "Go语言的并发模型基于 goroutine ...",
+      "score": 7.82,
+      "userId": 1,
+      "orgTag": "dept:tech",
+      "isPublic": false
+    }
+  ]
+}
+```
+
+到这里，阶段十一已经把系统从“能写入知识库”推进到了“能按权限做混合检索”。阶段十二就可以在这个检索接口之上继续接 WebSocket 对话与上下文拼装，而不必再回头实现 Retrieval 基础能力。
+
+补充：本地已经实际跑通 `scripts/acceptance/stage11_acceptance.sh`。当前脚本不再只截取首个 chunk 前缀，而是优先对已知验收文档使用固定 query 白名单；对 `Hashimoto.pdf`，分别使用一组精确词和一组主题词做断言。一次真实验收的结果是：
+
+- owner 用户上传并索引 `Hashimoto.pdf` 后，精确词 `Tatsunori Hashimoto` 与主题词 `pretrained language models` 均成功命中该文档
+- 文档为 `isPublic=false` 时，自动注册的 stranger 用户无法搜索到同一文档
+- 非法 `topK=abc` 返回 400

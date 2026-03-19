@@ -610,17 +610,17 @@ curl http://localhost:9200/knowledge_base/_search?size=1
 - Rescore 二次排序
 
 ### 实现任务
-- [ ] 创建 `internal/service/search_service.go`
-- [ ] 实现查询标准化:
+- [x] 创建 `internal/service/search_service.go`
+- [x] 实现查询标准化:
   - 移除停用词（"是谁"、"怎么" 等）
   - 提取核心短语
-- [ ] 实现混合检索逻辑:
+- [x] 实现混合检索逻辑:
   - KNN 向量搜索（k=topK*30）
   - Query 文本匹配（BM25）
   - Rescore 二次打分
   - 权限过滤（public / org_tag / user_id）
-- [ ] 创建 `internal/handler/search_handler.go`
-- [ ] 实现 API: `GET /api/v1/search/hybrid?query=xxx&topK=10`
+- [x] 创建 `internal/handler/search_handler.go`
+- [x] 实现 API: `GET /api/v1/search/hybrid?query=xxx&topK=10`
 
 ### 验收标准
 ```bash
