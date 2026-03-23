@@ -64,6 +64,7 @@ type fakeOrgTagRepo struct {
 	createFn                    func(tag *model.OrganizationTag) error
 	findAllFn                   func() ([]model.OrganizationTag, error)
 	findByIDFn                  func(id string) (*model.OrganizationTag, error)
+	findBatchByIDsFn            func(tagIDs []string) ([]model.OrganizationTag, error)
 	findByParentTagFn           func(parentTag *string) ([]model.OrganizationTag, error)
 	updateFn                    func(tag *model.OrganizationTag) error
 	deleteFn                    func(tagID string) error
@@ -89,6 +90,13 @@ func (f *fakeOrgTagRepo) FindByID(id string) (*model.OrganizationTag, error) {
 		return f.findByIDFn(id)
 	}
 	return nil, gorm.ErrRecordNotFound
+}
+
+func (f *fakeOrgTagRepo) FindBatchByIDs(tagIDs []string) ([]model.OrganizationTag, error) {
+	if f.findBatchByIDsFn != nil {
+		return f.findBatchByIDsFn(tagIDs)
+	}
+	return []model.OrganizationTag{}, nil
 }
 
 func (f *fakeOrgTagRepo) FindByParentTag(parentTag *string) ([]model.OrganizationTag, error) {

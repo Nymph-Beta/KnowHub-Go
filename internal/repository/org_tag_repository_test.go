@@ -81,6 +81,31 @@ func TestOrganizationTagRepository_FindByID(t *testing.T) {
 	}
 }
 
+func TestOrganizationTagRepository_FindBatchByIDs(t *testing.T) {
+	repo, mock := newMockOrgTagRepo(t)
+
+	rows := sqlmock.NewRows([]string{
+		"tag_id", "name", "description", "parent_tag", "created_by", "updated_by", "created_at", "updated_at",
+	}).
+		AddRow("team-a", "Team A", "A team", nil, "admin", "admin", time.Now(), time.Now()).
+		AddRow("team-b", "Team B", "B team", nil, "admin", "admin", time.Now(), time.Now())
+
+	mock.ExpectQuery("SELECT .* FROM `organization_tags` WHERE tag_id IN \\(.+\\) ORDER BY tag_id ASC").
+		WithArgs("team-a", "team-b").
+		WillReturnRows(rows)
+
+	tags, err := repo.FindBatchByIDs([]string{"team-a", "team-b"})
+	if err != nil {
+		t.Fatalf("FindBatchByIDs() error: %v", err)
+	}
+	if len(tags) != 2 || tags[0].TagID != "team-a" || tags[1].TagID != "team-b" {
+		t.Fatalf("unexpected tags: %+v", tags)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestOrganizationTagRepository_FindByParentTag_Root(t *testing.T) {
 	repo, mock := newMockOrgTagRepo(t)
 

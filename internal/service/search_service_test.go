@@ -39,6 +39,10 @@ func (f *fakeSearchESClient) SearchDocuments(ctx context.Context, req es.SearchR
 	return nil, nil
 }
 
+func (f *fakeSearchESClient) DeleteDocumentsByFileMD5(ctx context.Context, fileMD5 string) error {
+	return nil
+}
+
 func (f *fakeSearchESClient) IndexName() string {
 	return "knowledge_base"
 }

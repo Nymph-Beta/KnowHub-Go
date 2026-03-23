@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -150,6 +152,61 @@ func TestUploadRepository_FindBatchByMD5s_Empty(t *testing.T) {
 	}
 	if len(uploads) != 0 {
 		t.Fatalf("expected empty uploads, got %+v", uploads)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestUploadRepository_FindFilesByUserID(t *testing.T) {
+	repo, mock := newMockUploadRepo(t, nil)
+
+	mock.ExpectQuery("SELECT .* FROM `file_uploads` WHERE user_id = \\? AND status = \\? ORDER BY created_at DESC").
+		WithArgs(uint(2), 1).
+		WillReturnRows(fileUploadRows())
+
+	uploads, err := repo.FindFilesByUserID(2)
+	if err != nil {
+		t.Fatalf("FindFilesByUserID() error: %v", err)
+	}
+	if len(uploads) != 1 || uploads[0].UserID != 2 {
+		t.Fatalf("unexpected uploads: %+v", uploads)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestUploadRepository_FindAccessibleFiles(t *testing.T) {
+	repo, mock := newMockUploadRepo(t, nil)
+
+	mock.ExpectQuery("SELECT .* FROM `file_uploads` WHERE status = \\? AND \\(user_id = \\? OR is_public = \\? OR org_tag IN \\(.+\\)\\) ORDER BY created_at DESC").
+		WithArgs(1, uint(7), true, "team-a", "team-b").
+		WillReturnRows(fileUploadRows())
+
+	uploads, err := repo.FindAccessibleFiles(7, []string{"team-a", "team-b"})
+	if err != nil {
+		t.Fatalf("FindAccessibleFiles() error: %v", err)
+	}
+	if len(uploads) != 1 {
+		t.Fatalf("unexpected uploads: %+v", uploads)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestUploadRepository_DeleteFileUploadRecord(t *testing.T) {
+	repo, mock := newMockUploadRepo(t, nil)
+
+	mock.ExpectBegin()
+	mock.ExpectExec("DELETE FROM `file_uploads` WHERE file_md5 = \\? AND user_id = \\?").
+		WithArgs("md5v", uint(9)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := repo.DeleteFileUploadRecord("md5v", 9); err != nil {
+		t.Fatalf("DeleteFileUploadRecord() error: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -404,6 +461,59 @@ func (s *fakeRedisBackend) execute(writer *bufio.Writer, args []string) error {
 			return writeNilBulkString(writer)
 		}
 		return writeBulkBytes(writer, val)
+	case "set":
+		if len(args) < 3 {
+			return fmt.Errorf("ERR wrong number of arguments for 'set'")
+		}
+		s.set(args[1], []byte(args[2]))
+		return writeSimpleString(writer, "OK")
+	case "expire":
+		if len(args) != 3 {
+			return fmt.Errorf("ERR wrong number of arguments for 'expire'")
+		}
+		if _, err := strconv.ParseInt(args[2], 10, 64); err != nil {
+			return err
+		}
+		return writeInteger(writer, 1)
+	case "mget":
+		if len(args) < 2 {
+			return fmt.Errorf("ERR wrong number of arguments for 'mget'")
+		}
+		if err := writeArrayHeader(writer, len(args)-1); err != nil {
+			return err
+		}
+		for _, key := range args[1:] {
+			val, ok := s.get(key)
+			if !ok {
+				if err := writeNilBulkString(writer); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := writeBulkBytes(writer, val); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "scan":
+		if len(args) < 2 {
+			return fmt.Errorf("ERR wrong number of arguments for 'scan'")
+		}
+		cursor, err := strconv.ParseUint(args[1], 10, 64)
+		if err != nil {
+			return err
+		}
+		if cursor != 0 {
+			return writeArrayOfBulkStrings(writer, "0")
+		}
+
+		matchPattern := "*"
+		for i := 2; i < len(args)-1; i++ {
+			if strings.EqualFold(args[i], "match") {
+				matchPattern = args[i+1]
+			}
+		}
+		return writeScanReply(writer, "0", s.keys(matchPattern))
 	case "del":
 		if len(args) < 2 {
 			return fmt.Errorf("ERR wrong number of arguments for 'del'")
@@ -442,6 +552,31 @@ func (s *fakeRedisBackend) del(key string) bool {
 		delete(s.values, key)
 	}
 	return ok
+}
+
+func (s *fakeRedisBackend) set(key string, value []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	s.values[key] = cp
+}
+
+func (s *fakeRedisBackend) keys(matchPattern string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	keys := make([]string, 0, len(s.values))
+	for key := range s.values {
+		matched, err := path.Match(matchPattern, key)
+		if err != nil || !matched {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (s *fakeRedisBackend) getBit(key string, offset int64) int {
@@ -581,4 +716,26 @@ func writeBulkBytes(w *bufio.Writer, b []byte) error {
 	}
 	_, err := w.WriteString("\r\n")
 	return err
+}
+
+func writeArrayOfBulkStrings(w *bufio.Writer, values ...string) error {
+	if err := writeArrayHeader(w, len(values)); err != nil {
+		return err
+	}
+	for _, value := range values {
+		if err := writeBulkBytes(w, []byte(value)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeScanReply(w *bufio.Writer, cursor string, keys []string) error {
+	if err := writeArrayHeader(w, 2); err != nil {
+		return err
+	}
+	if err := writeBulkBytes(w, []byte(cursor)); err != nil {
+		return err
+	}
+	return writeArrayOfBulkStrings(w, keys...)
 }

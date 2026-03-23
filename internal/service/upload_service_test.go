@@ -18,10 +18,16 @@ type fakeUploadRepo struct {
 	createFn                     func(upload *model.FileUpload) error
 	findByFileMD5AndUserIDFn     func(fileMD5 string, userID uint) (*model.FileUpload, error)
 	findBatchByMD5sFn            func(fileMD5s []string) ([]model.FileUpload, error)
+	findFilesByUserIDFn          func(userID uint) ([]model.FileUpload, error)
+	findAccessibleFilesFn        func(userID uint, orgTags []string) ([]model.FileUpload, error)
+	findAccessibleFileByMD5Fn    func(userID uint, orgTags []string, fileMD5 string) (*model.FileUpload, error)
+	findAccessibleFilesByNameFn  func(userID uint, orgTags []string, fileName string) ([]model.FileUpload, error)
 	findByIDFn                   func(id uint) (*model.FileUpload, error)
+	deleteFileUploadRecordFn     func(fileMD5 string, userID uint) error
 	updateFileUploadStatusFn     func(fileMD5 string, userID uint, status int, mergedAt *time.Time) error
 	createChunkInfoFn            func(chunk *model.ChunkInfo) error
 	findChunksByFileMD5Fn        func(fileMD5 string) ([]model.ChunkInfo, error)
+	deleteChunkInfosByFileMD5Fn  func(fileMD5 string) error
 	isChunkUploadedFn            func(ctx context.Context, fileMD5 string, userID uint, chunkIndex int) (bool, error)
 	markChunkUploadedFn          func(ctx context.Context, fileMD5 string, userID uint, chunkIndex int) error
 	getUploadedChunksFromRedisFn func(ctx context.Context, fileMD5 string, userID uint, totalChunks int) ([]int, error)
@@ -49,11 +55,46 @@ func (f *fakeUploadRepo) FindBatchByMD5s(fileMD5s []string) ([]model.FileUpload,
 	return []model.FileUpload{}, nil
 }
 
+func (f *fakeUploadRepo) FindFilesByUserID(userID uint) ([]model.FileUpload, error) {
+	if f.findFilesByUserIDFn != nil {
+		return f.findFilesByUserIDFn(userID)
+	}
+	return []model.FileUpload{}, nil
+}
+
+func (f *fakeUploadRepo) FindAccessibleFiles(userID uint, orgTags []string) ([]model.FileUpload, error) {
+	if f.findAccessibleFilesFn != nil {
+		return f.findAccessibleFilesFn(userID, orgTags)
+	}
+	return []model.FileUpload{}, nil
+}
+
+func (f *fakeUploadRepo) FindAccessibleFileByMD5(userID uint, orgTags []string, fileMD5 string) (*model.FileUpload, error) {
+	if f.findAccessibleFileByMD5Fn != nil {
+		return f.findAccessibleFileByMD5Fn(userID, orgTags, fileMD5)
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (f *fakeUploadRepo) FindAccessibleFilesByName(userID uint, orgTags []string, fileName string) ([]model.FileUpload, error) {
+	if f.findAccessibleFilesByNameFn != nil {
+		return f.findAccessibleFilesByNameFn(userID, orgTags, fileName)
+	}
+	return []model.FileUpload{}, nil
+}
+
 func (f *fakeUploadRepo) FindByID(id uint) (*model.FileUpload, error) {
 	if f.findByIDFn != nil {
 		return f.findByIDFn(id)
 	}
 	return nil, gorm.ErrRecordNotFound
+}
+
+func (f *fakeUploadRepo) DeleteFileUploadRecord(fileMD5 string, userID uint) error {
+	if f.deleteFileUploadRecordFn != nil {
+		return f.deleteFileUploadRecordFn(fileMD5, userID)
+	}
+	return nil
 }
 
 func (f *fakeUploadRepo) UpdateFileUploadStatus(fileMD5 string, userID uint, status int, mergedAt *time.Time) error {
@@ -75,6 +116,13 @@ func (f *fakeUploadRepo) FindChunksByFileMD5(fileMD5 string) ([]model.ChunkInfo,
 		return f.findChunksByFileMD5Fn(fileMD5)
 	}
 	return []model.ChunkInfo{}, nil
+}
+
+func (f *fakeUploadRepo) DeleteChunkInfosByFileMD5(fileMD5 string) error {
+	if f.deleteChunkInfosByFileMD5Fn != nil {
+		return f.deleteChunkInfosByFileMD5Fn(fileMD5)
+	}
+	return nil
 }
 
 func (f *fakeUploadRepo) IsChunkUploaded(ctx context.Context, fileMD5 string, userID uint, chunkIndex int) (bool, error) {
