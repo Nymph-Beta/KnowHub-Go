@@ -94,7 +94,15 @@ func main() {
 	var searchService service.SearchService
 	var llmClient llm.Client
 	var chatService service.ChatService
+	var tikaClient *tika.Client
+	var documentService service.DocumentService
+	var conversationService service.ConversationService
 	var err error
+
+	tikaClient, err = tika.NewClient(cfg.Tika)
+	if err != nil {
+		log.Errorf("初始化 Tika 客户端失败，文档预览与后台文档处理将不可用: %v", err)
+	}
 
 	embeddingClient, err = embedding.NewClient(cfg.Embedding)
 	if err != nil {
@@ -117,13 +125,26 @@ func main() {
 	} else {
 		chatService = service.NewChatService(searchService, llmClient, conversationRepo, cfg.LLM)
 	}
+	documentService = service.NewDocumentService(
+		uploadRepo,
+		orgTagRepo,
+		userService,
+		service.NewMinioDocumentStorage(storage.MinIOClient),
+		cfg.MinIO.BucketName,
+		tikaClient,
+		docVectorRepo,
+		esClient,
+	)
+	conversationService = service.NewConversationService(conversationRepo, userService)
 
 	// 4. Handler (注入 Service)
 	userHandler := handler.NewUserHandler(userService)
 	orgTagHandler := handler.NewOrgTagHandler(orgTagService)
 	uploadHandler := handler.NewUploadHandler(uploadService)
+	documentHandler := handler.NewDocumentHandler(documentService)
 	searchHandler := handler.NewSearchHandler(searchService)
 	chatHandler := handler.NewChatHandler(chatService, userService, jwtManager, cfg.LLM)
+	conversationHandler := handler.NewConversationHandler(conversationService)
 
 	// 4. 设置 Gin 模式
 	gin.SetMode(cfg.Server.Mode)
@@ -151,13 +172,18 @@ func main() {
 	upload.Use(middleware.AuthMiddleware(jwtManager, userService))
 	{
 		upload.POST("/upload/simple", uploadHandler.SimpleUpload)
-		upload.GET("/documents/download", uploadHandler.Download)
+		upload.GET("/documents/accessible", documentHandler.ListAccessibleFiles)
+		upload.GET("/documents/uploads", documentHandler.ListUploadedFiles)
+		upload.DELETE("/documents/:fileMd5", documentHandler.DeleteDocument)
+		upload.GET("/documents/download", documentHandler.GenerateDownloadURL)
+		upload.GET("/documents/preview", documentHandler.PreviewFile)
 		// 阶段七：分片上传
 		upload.POST("/upload/check", uploadHandler.CheckFile)
 		upload.POST("/upload/chunk", uploadHandler.UploadChunk)
 		upload.POST("/upload/merge", uploadHandler.MergeChunks)
 		upload.GET("/search/hybrid", searchHandler.HybridSearch)
 		upload.GET("/chat/websocket-token", chatHandler.GetWebSocketToken)
+		upload.GET("/users/conversation", conversationHandler.GetConversations)
 	}
 
 	r.GET("/chat/:token", chatHandler.HandleWebSocket)
@@ -168,7 +194,9 @@ func main() {
 	{
 		// 用户管理（属于用户域，但只允许管理员访问）
 		admin.GET("/users", userHandler.ListUsers)
+		admin.GET("/users/list", userHandler.ListUsers)
 		admin.PUT("/users/:userId/org-tags", userHandler.AssignOrgTagsToUser)
+		admin.GET("/conversation", conversationHandler.GetAllConversations)
 
 		// 标签管理（独立标签域 Handler）
 		orgTags := admin.Group("/org-tags")
@@ -201,9 +229,8 @@ func main() {
 	// r.Run(":" + cfg.Server.Port)
 
 	consumerCancel := func() {}
-	tikaClient, err := tika.NewClient(cfg.Tika)
-	if err != nil {
-		log.Errorf("初始化 Tika 客户端失败，跳过后台文档处理 Consumer: %v", err)
+	if tikaClient == nil {
+		log.Errorf("Tika 未就绪，跳过后台文档处理 Consumer")
 	} else if embeddingClient == nil || esClient == nil {
 		log.Errorf("Embedding/Elasticsearch 未就绪，跳过后台文档处理 Consumer")
 	} else {

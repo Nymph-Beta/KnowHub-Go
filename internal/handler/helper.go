@@ -45,6 +45,8 @@ func mapServiceError(err error) (httpStatus int, message string) {
 		return http.StatusBadRequest, "Not all chunks have been uploaded"
 	case errors.Is(err, service.ErrMergeFailed):
 		return http.StatusInternalServerError, "Failed to merge chunks"
+	case errors.Is(err, service.ErrServiceUnavailable):
+		return http.StatusServiceUnavailable, "Service unavailable"
 	default:
 		return http.StatusInternalServerError, "Internal server error"
 	}
