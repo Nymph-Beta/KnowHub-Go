@@ -339,3 +339,234 @@ api_style = openai_compatible
 4. **阶段 20**：再考虑多链路路由、多模型能力分发、Agent 化
 
 也就是说，阶段十二.5 解决的是“别把阶段十八和二十最容易返工的点继续写死”；但真正的深层改造，仍然应该按学习路径在后续阶段推进。
+
+---
+
+# 阶段十三（后端先行版）完善功能：文档管理、会话查询、管理员审计
+
+阶段十三原本包含“完善功能 + 前端集成”，但这一轮有意只先补后端前置能力，不启动前端。
+
+原因很直接：如果文档管理、HTTP 会话历史和管理员审计接口还没稳定，前端联调只会把问题混在一起，定位成本很高。更合理的顺序是：
+
+1. 先把阶段十三要求的后端接口补齐
+2. 再确认接口语义和权限模型稳定
+3. 最后再进入前端集成设计与联调
+
+这次改造完成后，系统已经具备“可以进入前端集成设计”的后端基础。
+
+## 1. 文档管理从上传域里独立出来
+
+新增：
+
+- `internal/service/document_service.go`
+- `internal/handler/document_handler.go`
+- `internal/service/storage_keys.go`
+
+阶段七到阶段十二期间，文件相关能力主要围绕“上传”和“处理流水线”展开；但到了阶段十三，真正缺的是“已入库文档的管理能力”。
+
+所以这一步没有继续把逻辑塞进 `UploadService`，而是单独抽出了 `DocumentService`。这样职责边界会更清晰：
+
+- `UploadService` 负责上传、分片、合并
+- `DocumentService` 负责列表、删除、下载、预览
+
+当前补齐的接口是：
+
+- `GET /api/v1/documents/accessible`
+- `GET /api/v1/documents/uploads`
+- `DELETE /api/v1/documents/:fileMd5`
+- `GET /api/v1/documents/download`
+- `GET /api/v1/documents/preview`
+
+这组接口都挂在认证路由下，直接复用现有登录态。
+
+## 2. 文档权限模型与阶段十一检索保持一致
+
+更新：
+
+- `internal/repository/upload_repository.go`
+- `internal/repository/org_tag_repository.go`
+
+阶段十三最容易做错的地方，是文件列表权限和检索权限写成两套不同规则。当前实现刻意复用了阶段十一的权限口径：
+
+```text
+status = 1 AND (
+  user_id = 当前用户
+  OR is_public = true
+  OR org_tag IN 用户有效组织标签
+)
+```
+
+这里不是直接拿 `user.OrgTags` 原始字符串做判断，而是继续走 `GetUserEffectiveOrgTags`，保证“文档可见范围”和“检索可见范围”一致，不会出现：
+
+- 某文档能被检索命中，但列表里看不到
+- 或者列表里能看到，但检索时又被权限过滤掉
+
+另外，上传列表和可访问列表返回时，会批量补上 `orgTagName`，避免前端收到一堆只能自己再查名字的标签 ID。
+
+## 3. 删除文档做成完整清理，而不是只删一条 MySQL 记录
+
+更新：
+
+- `pkg/es/client.go`
+- `internal/repository/document_vector_repository.go`（复用已有删除能力）
+- `internal/repository/upload_repository.go`
+- `internal/service/document_service.go`
+
+这一步没有沿用“只删对象文件和 `file_uploads` 记录”的最小实现，而是直接做成完整清理链路。删除一个文档时，现在会依次处理：
+
+1. 删除 Elasticsearch 中该 `file_md5` 对应的检索文档
+2. 删除 MySQL `document_vectors`
+3. 删除 MinIO 中的最终合并文件
+4. 删除可能残留的分片对象
+5. 删除 Redis 上传标记
+6. 删除 `chunk_infos`
+7. 最后删除 `file_uploads`
+
+这里故意把主记录放在最后删。原因是只要主记录还在，系统就仍然保留了：
+
+- 对象键推导信息
+- 用户归属信息
+- chunk 关联信息
+
+一旦先删主记录，中途任何一步失败，后续清理就会变得更被动。
+
+这一步的价值不只是“删除功能可用”，而是避免留下检索脏数据。否则用户虽然看起来删掉了文件，但 ES 命中和 RAG 对话上下文里仍可能继续出现已删除内容。
+
+## 4. 下载与预览接口兼容前端，但内部优先用 `fileMd5`
+
+当前下载和预览接口都支持两种查询方式：
+
+- `fileMd5`
+- `fileName`
+
+内部优先按 `fileMd5` 处理，因为它才是稳定主键；但为了后面接现有前端，仍然兼容 `fileName` 查询。
+
+这里额外做了一个安全约束：如果只传 `fileName` 且当前用户可访问范围内命中了多个同名文件，接口不会猜测目标，而是直接返回参数错误，要求调用方改用 `fileMd5`。
+
+这样可以兼顾两个目标：
+
+- 现在先不改前端依赖方式
+- 后面真正联调时也不会因为同名文件把下载/预览指错对象
+
+预览能力本身是通过：
+
+- MinIO 取对象流
+- Tika 提取纯文本
+
+来完成的。如果 Tika 客户端未初始化，预览接口会明确返回 `503`，而不是伪装成“文件不存在”。
+
+## 5. 对话历史不再只存在于 WebSocket 内部
+
+新增：
+
+- `internal/service/conversation_service.go`
+- `internal/handler/conversation_handler.go`
+
+阶段十二时，会话历史虽然已经落 Redis，但它只服务于 WebSocket 对话流程本身。阶段十三补的是“把这份历史变成可被 HTTP 读取的业务能力”。
+
+当前新增了两个接口：
+
+- `GET /api/v1/users/conversation`
+- `GET /api/v1/admin/conversation`
+
+这里没有让 handler 直接拼装 `GetConversationID + GetConversationHistory`，而是抽了 `ConversationService`，把会话读取逻辑集中起来。这样可以避免：
+
+- chat 链路自己管一套会话访问
+- HTTP 查询再各写一套
+
+用户接口返回当前会话历史；管理员接口返回跨用户聚合后的会话消息列表，并支持：
+
+- `userid`
+- `start_date`
+- `end_date`
+
+三种过滤维度。
+
+## 6. 管理员会话扫描显式改为 `SCAN`，不使用 `KEYS`
+
+更新：
+
+- `internal/repository/conversation_repository.go`
+
+管理员查看所有对话，本质上需要先从 Redis 找到：
+
+```text
+user:*:current_conversation
+```
+
+对应的映射关系。
+
+这里刻意没有用最省事的 `KEYS`，而是改成了 `SCAN`。原因很明确：
+
+- `KEYS` 会阻塞式扫描整个 key 空间
+- key 数量一大就会影响 Redis 实例响应
+
+对当前学习项目来说，`KEYS` 也许“能跑”；但阶段十三已经属于会被前端和管理员直接依赖的能力，继续把这种明显不适合扩展的实现写进仓库，只会把后续返工留到更晚。
+
+所以这里虽然仍是简化版实现，但至少在 key 扫描方式上，已经朝更合理的方向收口。
+
+## 7. 路由兼容性小收口
+
+更新：
+
+- `cmd/server/main.go`
+
+除了新增文档管理和会话查询接口外，这一步还额外补了一个兼容别名：
+
+- `GET /api/v1/admin/users/list`
+
+当前它直接复用已有的管理员用户列表逻辑。这样做的目的不是增加一套新实现，而是给后面接前端时保留兼容面，避免因为“后端已经有 `/admin/users`，前端却写的是 `/admin/users/list`”而出现无意义的联调阻塞。
+
+## 8. 测试补齐情况
+
+新增或扩展测试覆盖了：
+
+- `internal/service/document_service_test.go`
+- `internal/service/conversation_service_test.go`
+- `internal/handler/document_handler_test.go`
+- `internal/handler/conversation_handler_test.go`
+- `internal/repository/conversation_repository_test.go`
+- `internal/repository/upload_repository_test.go`
+- `internal/repository/org_tag_repository_test.go`
+- `pkg/es/client_test.go`
+
+重点验证的场景包括：
+
+- 文档可访问列表权限过滤
+- `orgTagName` 批量回填
+- 删除文档的完整清理顺序
+- 同名文件下载/预览歧义处理
+- 用户会话历史查询
+- 管理员按用户和日期过滤会话
+- Redis `SCAN` 会话映射读取
+- Elasticsearch 按 `file_md5` 删除
+
+本地验证命令：
+
+```bash
+GOCACHE=/tmp/paismart-go-cache \
+/home/yyy/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.11.linux-amd64/bin/go test ./...
+```
+
+结果：全仓 `go test ./...` 通过。
+
+## 9. 到这里为什么可以进入前端集成设计
+
+当前阶段十三后端先行版完成后，前端最依赖的基础能力已经具备：
+
+- 用户能看到自己可访问的文档
+- 用户能看到自己上传的文档
+- 用户能删除自己的文档
+- 用户能下载和预览文档
+- 用户能通过 HTTP 查看会话历史
+- 管理员能查看所有对话记录
+
+也就是说，现在缺的已经不再是“后端有没有接口”，而是：
+
+- 前端页面怎么组织这些能力
+- 前端调用参数统一走 `fileMd5` 还是兼容 `fileName`
+- 页面状态和交互如何对齐现有响应格式
+
+所以从阶段节奏上说，这里就是一个很合适的分界点：
+
+**后端前置必要功能已经实现完，可以开始前端集成设计。**
