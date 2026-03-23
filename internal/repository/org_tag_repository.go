@@ -20,6 +20,7 @@ type OrganizationTagRepository interface {
 	Create(tag *model.OrganizationTag) error
 	FindAll() ([]model.OrganizationTag, error)
 	FindByID(id string) (*model.OrganizationTag, error)
+	FindBatchByIDs(tagIDs []string) ([]model.OrganizationTag, error)
 	FindByParentTag(parentTag *string) ([]model.OrganizationTag, error)
 	// Update 更新标签信息（name, description, parent_tag, updated_by）
 	Update(tag *model.OrganizationTag) error
@@ -72,6 +73,20 @@ func (r *organizationTagRepository) FindByID(id string) (*model.OrganizationTag,
 		return nil, err
 	}
 	return &tag, nil
+}
+
+func (r *organizationTagRepository) FindBatchByIDs(tagIDs []string) ([]model.OrganizationTag, error) {
+	if len(tagIDs) == 0 {
+		return []model.OrganizationTag{}, nil
+	}
+
+	var tags []model.OrganizationTag
+	if err := r.db.Where("tag_id IN ?", tagIDs).
+		Order("tag_id ASC").
+		Find(&tags).Error; err != nil {
+		return nil, err
+	}
+	return tags, nil
 }
 
 func (r *organizationTagRepository) FindByParentTag(parentTag *string) ([]model.OrganizationTag, error) {

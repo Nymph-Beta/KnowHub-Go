@@ -25,6 +25,7 @@ type Client interface {
 	EnsureIndex(ctx context.Context) error
 	BulkIndexDocuments(ctx context.Context, docs []model.EsDocument) error
 	SearchDocuments(ctx context.Context, req SearchRequest) ([]SearchHit, error)
+	DeleteDocumentsByFileMD5(ctx context.Context, fileMD5 string) error
 	IndexName() string
 }
 
@@ -212,6 +213,40 @@ func (c *client) SearchDocuments(ctx context.Context, req SearchRequest) ([]Sear
 		})
 	}
 	return hits, nil
+}
+
+func (c *client) DeleteDocumentsByFileMD5(ctx context.Context, fileMD5 string) error {
+	fileMD5 = strings.TrimSpace(fileMD5)
+	if fileMD5 == "" {
+		return fmt.Errorf("file_md5 is empty")
+	}
+
+	body, err := json.Marshal(map[string]interface{}{
+		"query": map[string]interface{}{
+			"term": map[string]interface{}{
+				"file_md5": fileMD5,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal delete-by-query body failed: %w", err)
+	}
+
+	res, err := c.raw.DeleteByQuery(
+		[]string{c.cfg.IndexName},
+		bytes.NewReader(body),
+		c.raw.DeleteByQuery.WithContext(ctx),
+		c.raw.DeleteByQuery.WithRefresh(true),
+	)
+	if err != nil {
+		return fmt.Errorf("delete documents by file_md5 failed: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		return fmt.Errorf("delete documents by file_md5 failed: %s", responseError(res))
+	}
+	return nil
 }
 
 func (c *client) createIndex(ctx context.Context) error {

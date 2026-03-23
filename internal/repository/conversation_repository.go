@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,9 +20,11 @@ const (
 )
 
 type ConversationRepository interface {
+	GetConversationID(ctx context.Context, userID uint) (string, error)
 	GetOrCreateConversationID(ctx context.Context, userID uint) (string, error)
 	GetConversationHistory(ctx context.Context, conversationID string) ([]model.ChatMessage, error)
 	UpdateConversationHistory(ctx context.Context, conversationID string, messages []model.ChatMessage) error
+	GetAllUserConversationMappings(ctx context.Context) (map[uint]string, error)
 }
 
 type conversationRepository struct {
@@ -43,23 +46,38 @@ func (r *conversationRepository) GetOrCreateConversationID(ctx context.Context, 
 		return "", fmt.Errorf("conversation repository is not ready")
 	}
 
-	key := currentConversationKey(userID)
-	conversationID, err := r.rdb.Get(ctx, key).Result()
+	conversationID, err := r.GetConversationID(ctx, userID)
 	switch {
-	case err == nil && strings.TrimSpace(conversationID) != "":
-		if expireErr := r.rdb.Expire(ctx, key, r.ttl).Err(); expireErr != nil {
+	case err != nil:
+		return "", err
+	case strings.TrimSpace(conversationID) != "":
+		if expireErr := r.rdb.Expire(ctx, currentConversationKey(userID), r.ttl).Err(); expireErr != nil {
 			return "", fmt.Errorf("refresh current conversation ttl failed: %w", expireErr)
 		}
 		return conversationID, nil
-	case err != nil && err != redis.Nil:
-		return "", fmt.Errorf("get current conversation failed: %w", err)
 	}
 
 	conversationID = token.GenerateRandomString(16)
-	if err := r.rdb.Set(ctx, key, conversationID, r.ttl).Err(); err != nil {
+	if err := r.rdb.Set(ctx, currentConversationKey(userID), conversationID, r.ttl).Err(); err != nil {
 		return "", fmt.Errorf("set current conversation failed: %w", err)
 	}
 	return conversationID, nil
+}
+
+func (r *conversationRepository) GetConversationID(ctx context.Context, userID uint) (string, error) {
+	if r.rdb == nil || userID == 0 {
+		return "", fmt.Errorf("conversation repository is not ready")
+	}
+
+	conversationID, err := r.rdb.Get(ctx, currentConversationKey(userID)).Result()
+	switch {
+	case err == redis.Nil:
+		return "", nil
+	case err != nil:
+		return "", fmt.Errorf("get current conversation failed: %w", err)
+	default:
+		return strings.TrimSpace(conversationID), nil
+	}
 }
 
 func (r *conversationRepository) GetConversationHistory(ctx context.Context, conversationID string) ([]model.ChatMessage, error) {
@@ -99,6 +117,48 @@ func (r *conversationRepository) UpdateConversationHistory(ctx context.Context, 
 	return nil
 }
 
+func (r *conversationRepository) GetAllUserConversationMappings(ctx context.Context) (map[uint]string, error) {
+	if r.rdb == nil {
+		return nil, fmt.Errorf("conversation repository is not ready")
+	}
+
+	result := make(map[uint]string)
+	var cursor uint64
+
+	for {
+		keys, nextCursor, err := r.rdb.Scan(ctx, cursor, "user:*:current_conversation", 100).Result()
+		if err != nil {
+			return nil, fmt.Errorf("scan current conversation keys failed: %w", err)
+		}
+
+		if len(keys) > 0 {
+			values, err := r.rdb.MGet(ctx, keys...).Result()
+			if err != nil {
+				return nil, fmt.Errorf("get scanned conversation values failed: %w", err)
+			}
+
+			for i, key := range keys {
+				userID, parseErr := parseUserIDFromConversationKey(key)
+				if parseErr != nil {
+					continue
+				}
+				value, ok := values[i].(string)
+				if !ok || strings.TrimSpace(value) == "" {
+					continue
+				}
+				result[userID] = strings.TrimSpace(value)
+			}
+		}
+
+		if nextCursor == 0 {
+			break
+		}
+		cursor = nextCursor
+	}
+
+	return result, nil
+}
+
 func currentConversationKey(userID uint) string {
 	return fmt.Sprintf("user:%d:current_conversation", userID)
 }
@@ -115,4 +175,19 @@ func trimConversationHistory(messages []model.ChatMessage, limit int) []model.Ch
 		return messages
 	}
 	return messages[len(messages)-limit:]
+}
+
+func parseUserIDFromConversationKey(key string) (uint, error) {
+	trimmed := strings.TrimSpace(key)
+	if !strings.HasPrefix(trimmed, "user:") || !strings.HasSuffix(trimmed, ":current_conversation") {
+		return 0, fmt.Errorf("invalid conversation key: %s", key)
+	}
+
+	userIDPart := strings.TrimPrefix(trimmed, "user:")
+	userIDPart = strings.TrimSuffix(userIDPart, ":current_conversation")
+	parsed, err := strconv.ParseUint(userIDPart, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return uint(parsed), nil
 }
