@@ -167,11 +167,19 @@ func main() {
 		}
 	}
 
+	auth := r.Group("/api/v1/auth")
+	{
+		auth.POST("/refreshToken", userHandler.RefreshToken)
+	}
+
 	// 文件上传/下载路由（需要登录）
 	upload := r.Group("/api/v1")
 	upload.Use(middleware.AuthMiddleware(jwtManager, userService))
 	{
 		upload.POST("/upload/simple", uploadHandler.SimpleUpload)
+		upload.GET("/upload/status", uploadHandler.GetUploadStatus)
+		upload.GET("/upload/supported-types", uploadHandler.GetSupportedTypes)
+		upload.POST("/upload/fast-upload", uploadHandler.FastUpload)
 		upload.GET("/documents/accessible", documentHandler.ListAccessibleFiles)
 		upload.GET("/documents/uploads", documentHandler.ListUploadedFiles)
 		upload.DELETE("/documents/:fileMd5", documentHandler.DeleteDocument)
@@ -226,6 +234,11 @@ func main() {
 		c.JSON(200, gin.H{"message": "success", "data": body})
 	})
 
+	r.GET("/", func(c *gin.Context) {
+		c.Redirect(http.StatusTemporaryRedirect, "/app/")
+	})
+	r.Static("/app", "./web")
+
 	// r.Run(":" + cfg.Server.Port)
 
 	consumerCancel := func() {}
@@ -238,6 +251,7 @@ func main() {
 			tikaClient,
 			storage.MinIOClient,
 			cfg.MinIO.BucketName,
+			uploadRepo,
 			docVectorRepo,
 			embeddingClient,
 			esClient,
