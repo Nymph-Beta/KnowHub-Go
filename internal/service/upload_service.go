@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -69,6 +70,24 @@ type ChunkUploadResult struct {
 	Progress       float64 `json:"progress"`
 }
 
+type UploadStatusResult struct {
+	FileMD5          string  `json:"fileMd5"`
+	Status           int     `json:"status"`
+	ProcessingStatus string  `json:"processingStatus"`
+	Completed        bool    `json:"completed"`
+	UploadedChunks   []int   `json:"uploadedChunks"`
+	Progress         float64 `json:"progress"`
+}
+
+type FastUploadCheckResult struct {
+	CanQuickUpload   bool   `json:"canQuickUpload"`
+	FileMD5          string `json:"fileMd5,omitempty"`
+	FileName         string `json:"fileName,omitempty"`
+	TotalSize        int64  `json:"totalSize,omitempty"`
+	Status           int    `json:"status,omitempty"`
+	ProcessingStatus string `json:"processingStatus,omitempty"`
+}
+
 // MergeResult 分片合并后返回的文件信息
 type MergeResult struct {
 	ObjectURL string `json:"objectUrl"`
@@ -86,6 +105,15 @@ type UploadService interface {
 
 	// CheckFile 检查文件上传状态：秒传判断 + 已上传分片列表（阶段七）
 	CheckFile(ctx context.Context, fileMD5 string, userID uint) (*CheckResult, error)
+
+	// GetUploadStatus 返回当前文件的上传进度，兼容原始前端轮询接口。
+	GetUploadStatus(ctx context.Context, fileMD5 string, userID uint) (*UploadStatusResult, error)
+
+	// CheckFastUpload 返回秒传检查结果，兼容原始前端上传链路。
+	CheckFastUpload(ctx context.Context, fileMD5 string, userID uint) (*FastUploadCheckResult, error)
+
+	// GetSupportedTypes 返回允许上传的扩展名列表。
+	GetSupportedTypes() []string
 
 	// UploadChunk 上传单个分片到 MinIO 并在 Redis bitmap 中标记
 	UploadChunk(ctx context.Context, fileMD5 string, fileName string, totalSize int64, chunkIndex int, reader io.Reader, chunkSize int64, userID uint, orgTag string, isPublic bool) (*ChunkUploadResult, error)
@@ -208,12 +236,13 @@ func (s *uploadService) SimpleUpload(
 
 	// 4. 写入数据库记录
 	upload := &model.FileUpload{
-		FileMD5:   fileMD5,
-		FileName:  fileName,
-		TotalSize: int64(len(fileBytes)),
-		Status:    1, // 简单上传一次完成，直接标记为"上传完成"
-		UserID:    userID,
-		OrgTag:    orgTag,
+		FileMD5:          fileMD5,
+		FileName:         fileName,
+		TotalSize:        int64(len(fileBytes)),
+		Status:           model.FileUploadStatusUploaded, // 简单上传一次完成，直接标记为"上传完成"
+		ProcessingStatus: model.FileProcessingStatusPending,
+		UserID:           userID,
+		OrgTag:           orgTag,
 	}
 	if err := s.uploadRepo.Create(upload); err != nil {
 		log.Errorf("写入文件记录失败: %v", err)
@@ -300,6 +329,81 @@ func (s *uploadService) CheckFile(ctx context.Context, fileMD5 string, userID ui
 	return &CheckResult{Completed: false, UploadedChunks: uploadedChunks}, nil
 }
 
+func (s *uploadService) GetUploadStatus(ctx context.Context, fileMD5 string, userID uint) (*UploadStatusResult, error) {
+	fileMD5 = strings.TrimSpace(fileMD5)
+	if fileMD5 == "" || userID == 0 {
+		return nil, ErrInvalidInput
+	}
+
+	existing, err := s.uploadRepo.FindByFileMD5AndUserID(fileMD5, userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrFileNotFound
+		}
+		log.Errorf("GetUploadStatus: 查询文件记录失败: %v", err)
+		return nil, ErrInternal
+	}
+
+	result := &UploadStatusResult{
+		FileMD5:          existing.FileMD5,
+		Status:           existing.Status,
+		ProcessingStatus: existing.ProcessingStatus,
+		Completed:        existing.Status == model.FileUploadStatusUploaded,
+		UploadedChunks:   []int{},
+		Progress:         0,
+	}
+	if existing.Status == model.FileUploadStatusUploaded {
+		result.Progress = 100
+		return result, nil
+	}
+
+	totalChunks := calcTotalChunks(existing.TotalSize)
+	uploadedChunks, err := s.uploadRepo.GetUploadedChunksFromRedis(ctx, fileMD5, userID, totalChunks)
+	if err != nil {
+		log.Errorf("GetUploadStatus: 读取 Redis bitmap 失败: %v", err)
+		return nil, ErrInternal
+	}
+	result.UploadedChunks = uploadedChunks
+	if totalChunks > 0 {
+		result.Progress = float64(len(uploadedChunks)) / float64(totalChunks) * 100
+	}
+	return result, nil
+}
+
+func (s *uploadService) CheckFastUpload(ctx context.Context, fileMD5 string, userID uint) (*FastUploadCheckResult, error) {
+	fileMD5 = strings.TrimSpace(fileMD5)
+	if fileMD5 == "" || userID == 0 {
+		return nil, ErrInvalidInput
+	}
+
+	existing, err := s.uploadRepo.FindByFileMD5AndUserID(fileMD5, userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return &FastUploadCheckResult{CanQuickUpload: false}, nil
+		}
+		log.Errorf("CheckFastUpload: 查询文件记录失败: %v", err)
+		return nil, ErrInternal
+	}
+
+	return &FastUploadCheckResult{
+		CanQuickUpload:   existing.Status == model.FileUploadStatusUploaded,
+		FileMD5:          existing.FileMD5,
+		FileName:         existing.FileName,
+		TotalSize:        existing.TotalSize,
+		Status:           existing.Status,
+		ProcessingStatus: existing.ProcessingStatus,
+	}, nil
+}
+
+func (s *uploadService) GetSupportedTypes() []string {
+	types := make([]string, 0, len(allowedExtensions))
+	for ext := range allowedExtensions {
+		types = append(types, ext)
+	}
+	sort.Strings(types)
+	return types
+}
+
 // UploadChunk 上传单个分片：
 //  1. FindOrCreate FileUpload 记录
 //  2. 幂等检查（GETBIT）→ 已上传则跳过
@@ -341,19 +445,20 @@ func (s *uploadService) UploadChunk(
 			return nil, ErrInternal
 		}
 		upload := &model.FileUpload{
-			FileMD5:   fileMD5,
-			FileName:  fileName,
-			TotalSize: totalSize,
-			Status:    0,
-			UserID:    userID,
-			OrgTag:    orgTag,
-			IsPublic:  isPublic,
+			FileMD5:          fileMD5,
+			FileName:         fileName,
+			TotalSize:        totalSize,
+			Status:           model.FileUploadStatusUploading,
+			ProcessingStatus: model.FileProcessingStatusPending,
+			UserID:           userID,
+			OrgTag:           orgTag,
+			IsPublic:         isPublic,
 		}
 		if createErr := s.uploadRepo.Create(upload); createErr != nil {
 			log.Errorf("UploadChunk: 创建文件记录失败: %v", createErr)
 			return nil, ErrInternal
 		}
-	} else if existing.Status == 1 {
+	} else if existing.Status == model.FileUploadStatusUploaded {
 		uploadedChunks := makeRange(totalChunks)
 		return &ChunkUploadResult{UploadedChunks: uploadedChunks, Progress: 100}, nil
 	}
@@ -424,7 +529,7 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 
 	destKey := fmt.Sprintf("uploads/%d/%s/%s", userID, fileMD5, fileName)
 
-	if upload.Status == 1 {
+	if upload.Status == model.FileUploadStatusUploaded {
 		return &MergeResult{ObjectURL: destKey, FileMD5: fileMD5, FileName: fileName}, nil
 	}
 
@@ -470,8 +575,12 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 	log.Infof("MergeChunks: 文件合并成功: %s", destKey)
 
 	now := time.Now()
-	if err := s.uploadRepo.UpdateFileUploadStatus(fileMD5, userID, 1, &now); err != nil {
+	if err := s.uploadRepo.UpdateFileUploadStatus(fileMD5, userID, model.FileUploadStatusUploaded, &now); err != nil {
 		log.Errorf("MergeChunks: 更新文件状态失败: %v", err)
+		return nil, ErrInternal
+	}
+	if err := s.uploadRepo.UpdateFileProcessingStatus(fileMD5, userID, model.FileProcessingStatusPending); err != nil {
+		log.Errorf("MergeChunks: 更新处理状态失败: %v", err)
 		return nil, ErrInternal
 	}
 	s.produceFileTask(ctx, upload, destKey)
@@ -509,7 +618,15 @@ func makeRange(n int) []int {
 }
 
 func (s *uploadService) produceFileTask(ctx context.Context, upload *model.FileUpload, objectKey string) {
+	markFailed := func() {
+		if s.uploadRepo == nil || upload == nil {
+			return
+		}
+		_ = s.uploadRepo.UpdateFileProcessingStatus(upload.FileMD5, upload.UserID, model.FileProcessingStatusFailed)
+	}
+
 	if s.taskProducer == nil || upload == nil {
+		markFailed()
 		return
 	}
 
@@ -524,6 +641,7 @@ func (s *uploadService) produceFileTask(ctx context.Context, upload *model.FileU
 
 	if err := s.taskProducer.ProduceFileTask(ctx, task); err != nil {
 		log.Errorf("发送文件处理任务失败(不影响主流程): md5=%s err=%v", upload.FileMD5, err)
+		markFailed()
 		return
 	}
 	log.Infof("文件处理任务已投递: md5=%s", upload.FileMD5)

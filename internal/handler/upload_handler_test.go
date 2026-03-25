@@ -17,11 +17,14 @@ import (
 )
 
 type fakeUploadServiceForHandler struct {
-	simpleUploadFn func(ctx context.Context, userID uint, orgTag, fileName string, fileSize int64, reader io.Reader) (*service.UploadResult, error)
-	downloadFileFn func(ctx context.Context, fileMD5 string, userID uint) (*service.DownloadResult, error)
-	checkFileFn    func(ctx context.Context, fileMD5 string, userID uint) (*service.CheckResult, error)
-	uploadChunkFn  func(ctx context.Context, fileMD5 string, fileName string, totalSize int64, chunkIndex int, reader io.Reader, chunkSize int64, userID uint, orgTag string, isPublic bool) (*service.ChunkUploadResult, error)
-	mergeChunksFn  func(ctx context.Context, fileMD5 string, fileName string, userID uint) (*service.MergeResult, error)
+	simpleUploadFn    func(ctx context.Context, userID uint, orgTag, fileName string, fileSize int64, reader io.Reader) (*service.UploadResult, error)
+	downloadFileFn    func(ctx context.Context, fileMD5 string, userID uint) (*service.DownloadResult, error)
+	checkFileFn       func(ctx context.Context, fileMD5 string, userID uint) (*service.CheckResult, error)
+	getStatusFn       func(ctx context.Context, fileMD5 string, userID uint) (*service.UploadStatusResult, error)
+	fastUploadFn      func(ctx context.Context, fileMD5 string, userID uint) (*service.FastUploadCheckResult, error)
+	getSupportedTypes func() []string
+	uploadChunkFn     func(ctx context.Context, fileMD5 string, fileName string, totalSize int64, chunkIndex int, reader io.Reader, chunkSize int64, userID uint, orgTag string, isPublic bool) (*service.ChunkUploadResult, error)
+	mergeChunksFn     func(ctx context.Context, fileMD5 string, fileName string, userID uint) (*service.MergeResult, error)
 }
 
 func (f *fakeUploadServiceForHandler) SimpleUpload(ctx context.Context, userID uint, orgTag, fileName string, fileSize int64, reader io.Reader) (*service.UploadResult, error) {
@@ -45,6 +48,27 @@ func (f *fakeUploadServiceForHandler) CheckFile(ctx context.Context, fileMD5 str
 	return &service.CheckResult{Completed: false, UploadedChunks: []int{}}, nil
 }
 
+func (f *fakeUploadServiceForHandler) GetUploadStatus(ctx context.Context, fileMD5 string, userID uint) (*service.UploadStatusResult, error) {
+	if f.getStatusFn != nil {
+		return f.getStatusFn(ctx, fileMD5, userID)
+	}
+	return &service.UploadStatusResult{FileMD5: fileMD5, Status: 0, Completed: false, UploadedChunks: []int{}, Progress: 0}, nil
+}
+
+func (f *fakeUploadServiceForHandler) CheckFastUpload(ctx context.Context, fileMD5 string, userID uint) (*service.FastUploadCheckResult, error) {
+	if f.fastUploadFn != nil {
+		return f.fastUploadFn(ctx, fileMD5, userID)
+	}
+	return &service.FastUploadCheckResult{CanQuickUpload: false}, nil
+}
+
+func (f *fakeUploadServiceForHandler) GetSupportedTypes() []string {
+	if f.getSupportedTypes != nil {
+		return f.getSupportedTypes()
+	}
+	return []string{".pdf"}
+}
+
 func (f *fakeUploadServiceForHandler) UploadChunk(ctx context.Context, fileMD5 string, fileName string, totalSize int64, chunkIndex int, reader io.Reader, chunkSize int64, userID uint, orgTag string, isPublic bool) (*service.ChunkUploadResult, error) {
 	if f.uploadChunkFn != nil {
 		return f.uploadChunkFn(ctx, fileMD5, fileName, totalSize, chunkIndex, reader, chunkSize, userID, orgTag, isPublic)
@@ -66,6 +90,9 @@ func newUploadPhase7Router(h *UploadHandler) *gin.Engine {
 		c.Next()
 	})
 	r.POST("/upload/check", h.CheckFile)
+	r.GET("/upload/status", h.GetUploadStatus)
+	r.GET("/upload/supported-types", h.GetSupportedTypes)
+	r.POST("/upload/fast-upload", h.FastUpload)
 	r.POST("/upload/chunk", h.UploadChunk)
 	r.POST("/upload/merge", h.MergeChunks)
 	return r
@@ -121,6 +148,74 @@ func TestUploadHandler_CheckFile_Success(t *testing.T) {
 	}
 	if gotMD5 != "abc123" || gotUserID != 99 {
 		t.Fatalf("unexpected service args: md5=%s userID=%d", gotMD5, gotUserID)
+	}
+}
+
+func TestUploadHandler_GetUploadStatus_Success(t *testing.T) {
+	var gotMD5 string
+	svc := &fakeUploadServiceForHandler{
+		getStatusFn: func(ctx context.Context, fileMD5 string, userID uint) (*service.UploadStatusResult, error) {
+			gotMD5 = fileMD5
+			if userID != 99 {
+				t.Fatalf("unexpected user id: %d", userID)
+			}
+			return &service.UploadStatusResult{
+				FileMD5:        fileMD5,
+				Status:         0,
+				Completed:      false,
+				UploadedChunks: []int{0, 1},
+				Progress:       50,
+			}, nil
+		},
+	}
+	r := newUploadPhase7Router(NewUploadHandler(svc))
+
+	req := httptest.NewRequest(http.MethodGet, "/upload/status?fileMd5=abc123", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expect 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+	if gotMD5 != "abc123" {
+		t.Fatalf("unexpected md5: %s", gotMD5)
+	}
+}
+
+func TestUploadHandler_GetSupportedTypes_Success(t *testing.T) {
+	svc := &fakeUploadServiceForHandler{
+		getSupportedTypes: func() []string {
+			return []string{".docx", ".pdf"}
+		},
+	}
+	r := newUploadPhase7Router(NewUploadHandler(svc))
+
+	req := httptest.NewRequest(http.MethodGet, "/upload/supported-types", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expect 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestUploadHandler_FastUpload_Success(t *testing.T) {
+	var gotMD5 string
+	svc := &fakeUploadServiceForHandler{
+		fastUploadFn: func(ctx context.Context, fileMD5 string, userID uint) (*service.FastUploadCheckResult, error) {
+			gotMD5 = fileMD5
+			if userID != 99 {
+				t.Fatalf("unexpected user id: %d", userID)
+			}
+			return &service.FastUploadCheckResult{CanQuickUpload: true, FileMD5: fileMD5, FileName: "a.pdf"}, nil
+		},
+	}
+	r := newUploadPhase7Router(NewUploadHandler(svc))
+
+	w := doReq(r, http.MethodPost, "/upload/fast-upload", `{"md5":"abc123"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expect 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+	if gotMD5 != "abc123" {
+		t.Fatalf("unexpected md5: %s", gotMD5)
 	}
 }
 

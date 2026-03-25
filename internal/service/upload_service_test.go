@@ -25,6 +25,7 @@ type fakeUploadRepo struct {
 	findByIDFn                   func(id uint) (*model.FileUpload, error)
 	deleteFileUploadRecordFn     func(fileMD5 string, userID uint) error
 	updateFileUploadStatusFn     func(fileMD5 string, userID uint, status int, mergedAt *time.Time) error
+	updateFileProcessingStatusFn func(fileMD5 string, userID uint, processingStatus string) error
 	createChunkInfoFn            func(chunk *model.ChunkInfo) error
 	findChunksByFileMD5Fn        func(fileMD5 string) ([]model.ChunkInfo, error)
 	deleteChunkInfosByFileMD5Fn  func(fileMD5 string) error
@@ -100,6 +101,13 @@ func (f *fakeUploadRepo) DeleteFileUploadRecord(fileMD5 string, userID uint) err
 func (f *fakeUploadRepo) UpdateFileUploadStatus(fileMD5 string, userID uint, status int, mergedAt *time.Time) error {
 	if f.updateFileUploadStatusFn != nil {
 		return f.updateFileUploadStatusFn(fileMD5, userID, status, mergedAt)
+	}
+	return nil
+}
+
+func (f *fakeUploadRepo) UpdateFileProcessingStatus(fileMD5 string, userID uint, processingStatus string) error {
+	if f.updateFileProcessingStatusFn != nil {
+		return f.updateFileProcessingStatusFn(fileMD5, userID, processingStatus)
 	}
 	return nil
 }
@@ -284,6 +292,71 @@ func TestUploadService_CheckFile_InProgress(t *testing.T) {
 	}
 	if len(result.UploadedChunks) != 2 || result.UploadedChunks[0] != 0 || result.UploadedChunks[1] != 2 {
 		t.Fatalf("unexpected uploaded chunks: %+v", result.UploadedChunks)
+	}
+}
+
+func TestUploadService_GetUploadStatus_InProgress(t *testing.T) {
+	uploadRepo := &fakeUploadRepo{
+		findByFileMD5AndUserIDFn: func(fileMD5 string, userID uint) (*model.FileUpload, error) {
+			return &model.FileUpload{
+				FileMD5:   fileMD5,
+				UserID:    userID,
+				Status:    0,
+				TotalSize: DefaultChunkSize*2 + 100,
+			}, nil
+		},
+		getUploadedChunksFromRedisFn: func(ctx context.Context, fileMD5 string, userID uint, totalChunks int) ([]int, error) {
+			return []int{0, 2}, nil
+		},
+	}
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
+
+	result, err := svc.GetUploadStatus(context.Background(), "md5-z", 9)
+	if err != nil {
+		t.Fatalf("GetUploadStatus() error: %v", err)
+	}
+	if result.FileMD5 != "md5-z" || result.Status != 0 || result.Completed {
+		t.Fatalf("unexpected status result: %+v", result)
+	}
+	if len(result.UploadedChunks) != 2 || result.Progress <= 60 || result.Progress >= 70 {
+		t.Fatalf("unexpected upload progress result: %+v", result)
+	}
+}
+
+func TestUploadService_CheckFastUpload_Completed(t *testing.T) {
+	uploadRepo := &fakeUploadRepo{
+		findByFileMD5AndUserIDFn: func(fileMD5 string, userID uint) (*model.FileUpload, error) {
+			return &model.FileUpload{
+				FileMD5:   fileMD5,
+				FileName:  "a.pdf",
+				TotalSize: 128,
+				Status:    1,
+				UserID:    userID,
+			}, nil
+		},
+	}
+	svc := NewUploadService(uploadRepo, &fakeUploadUserRepo{}, nil, "uploads", nil)
+
+	result, err := svc.CheckFastUpload(context.Background(), "md5-q", 7)
+	if err != nil {
+		t.Fatalf("CheckFastUpload() error: %v", err)
+	}
+	if !result.CanQuickUpload || result.FileName != "a.pdf" || result.TotalSize != 128 {
+		t.Fatalf("unexpected fast upload result: %+v", result)
+	}
+}
+
+func TestUploadService_GetSupportedTypes_Sorted(t *testing.T) {
+	svc := NewUploadService(&fakeUploadRepo{}, &fakeUploadUserRepo{}, nil, "uploads", nil)
+
+	types := svc.GetSupportedTypes()
+	if len(types) == 0 {
+		t.Fatal("expected supported types")
+	}
+	for i := 1; i < len(types); i++ {
+		if types[i-1] > types[i] {
+			t.Fatalf("expected sorted types, got %v", types)
+		}
 	}
 }
 

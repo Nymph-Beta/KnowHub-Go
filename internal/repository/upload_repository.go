@@ -23,6 +23,7 @@ type UploadRepository interface {
 	FindByID(id uint) (*model.FileUpload, error)
 	DeleteFileUploadRecord(fileMD5 string, userID uint) error
 	UpdateFileUploadStatus(fileMD5 string, userID uint, status int, mergedAt *time.Time) error
+	UpdateFileProcessingStatus(fileMD5 string, userID uint, processingStatus string) error
 
 	// --- GORM: ChunkInfo ---
 	CreateChunkInfo(chunk *model.ChunkInfo) error
@@ -140,6 +141,12 @@ func (r *uploadRepository) UpdateFileUploadStatus(fileMD5 string, userID uint, s
 	return r.db.Model(&model.FileUpload{}).
 		Where("file_md5 = ? AND user_id = ?", fileMD5, userID).
 		Updates(updates).Error
+}
+
+func (r *uploadRepository) UpdateFileProcessingStatus(fileMD5 string, userID uint, processingStatus string) error {
+	return r.db.Model(&model.FileUpload{}).
+		Where("file_md5 = ? AND user_id = ?", fileMD5, userID).
+		Update("processing_status", processingStatus).Error
 }
 
 // ========== GORM: ChunkInfo ==========

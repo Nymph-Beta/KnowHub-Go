@@ -162,6 +162,84 @@ func (h *UploadHandler) CheckFile(c *gin.Context) {
 	})
 }
 
+func (h *UploadHandler) GetUploadStatus(c *gin.Context) {
+	user, ok := getUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	fileMD5 := c.Query("fileMd5")
+	if fileMD5 == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"error":   "Bad Request",
+			"message": "Query parameter 'fileMd5' is required",
+		})
+		return
+	}
+
+	result, err := h.uploadService.GetUploadStatus(c.Request.Context(), fileMD5, user.ID)
+	if err != nil {
+		status, msg := mapServiceError(err)
+		c.JSON(status, gin.H{
+			"code":    status,
+			"error":   http.StatusText(status),
+			"message": msg,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    http.StatusOK,
+		"message": "Upload status retrieved successfully",
+		"data":    result,
+	})
+}
+
+func (h *UploadHandler) GetSupportedTypes(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"code":    http.StatusOK,
+		"message": "Supported upload types retrieved successfully",
+		"data":    h.uploadService.GetSupportedTypes(),
+	})
+}
+
+func (h *UploadHandler) FastUpload(c *gin.Context) {
+	user, ok := getUserFromContext(c)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		MD5 string `json:"md5" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"error":   "Bad Request",
+			"message": "Field 'md5' is required",
+		})
+		return
+	}
+
+	result, err := h.uploadService.CheckFastUpload(c.Request.Context(), req.MD5, user.ID)
+	if err != nil {
+		status, msg := mapServiceError(err)
+		c.JSON(status, gin.H{
+			"code":    status,
+			"error":   http.StatusText(status),
+			"message": msg,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    http.StatusOK,
+		"message": "Fast upload check completed successfully",
+		"data":    result,
+	})
+}
+
 // UploadChunk 上传单个分片。
 // 路由：POST /api/v1/upload/chunk
 // 请求格式：multipart/form-data
