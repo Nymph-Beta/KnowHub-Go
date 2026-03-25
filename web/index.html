@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PaiSmart Workspace</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero card">
+        <div class="hero-copy">
+          <p class="eyebrow">PaiSmart Frontend</p>
+          <h1>把上传、检索、对话和管理放进同一个工作台。</h1>
+          <p class="hero-text">
+            这一版前端直接托管在 Go 服务里，不依赖额外构建链路。适合先完成联调、验证认证刷新、文档操作和 WebSocket 对话闭环。
+          </p>
+          <div class="hero-actions">
+            <a href="#session-panel" class="ghost-link">开始登录</a>
+            <a href="#chat-panel" class="ghost-link">直接看聊天链路</a>
+          </div>
+        </div>
+        <div class="hero-status">
+          <div class="status-pill" id="session-pill">未登录</div>
+          <div class="hero-metrics">
+            <div>
+              <span>路由入口</span>
+              <strong>/app/</strong>
+            </div>
+            <div>
+              <span>认证策略</span>
+              <strong>Access + Refresh</strong>
+            </div>
+            <div>
+              <span>聊天链路</span>
+              <strong>HTTP + WebSocket</strong>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="workspace-grid">
+        <section class="card panel" id="session-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Session</p>
+              <h2>认证与身份</h2>
+            </div>
+            <button class="secondary-button" id="logout-button" disabled>退出登录</button>
+          </div>
+
+          <div class="stack">
+            <div class="info-strip" id="profile-summary">
+              当前没有有效会话。登录后会自动拉取个人信息、支持的上传类型和文档概览。
+            </div>
+
+            <div class="form-grid">
+              <form class="mini-form" id="login-form">
+                <h3>登录</h3>
+                <label>
+                  用户名
+                  <input type="text" name="username" placeholder="alice" required />
+                </label>
+                <label>
+                  密码
+                  <input type="password" name="password" placeholder="******" required />
+                </label>
+                <button type="submit">登录</button>
+              </form>
+
+              <form class="mini-form" id="register-form">
+                <h3>注册</h3>
+                <label>
+                  用户名
+                  <input type="text" name="username" placeholder="new-user" required />
+                </label>
+                <label>
+                  密码
+                  <input type="password" name="password" placeholder="至少 6 位" required />
+                </label>
+                <button type="submit">创建账号</button>
+              </form>
+            </div>
+          </div>
+        </section>
+
+        <section class="card panel" id="upload-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Upload</p>
+              <h2>上传工作台</h2>
+            </div>
+            <button class="secondary-button" id="reload-supported-types">刷新类型</button>
+          </div>
+
+          <div class="stack">
+            <div class="chip-row" id="supported-types"></div>
+
+            <form class="mini-form" id="upload-form">
+              <p class="eyebrow">Simple</p>
+              <label>
+                文件
+                <input type="file" id="upload-file" name="file" required />
+              </label>
+              <label>
+                OrgTag
+                <input type="text" name="orgTag" placeholder="留空则回填 primary org" />
+              </label>
+              <button type="submit">简单上传</button>
+            </form>
+
+            <form class="mini-form" id="chunk-upload-form">
+              <h3>浏览器端分片上传</h3>
+              <p class="form-hint">固定按 5MB 分片。当前版本先在浏览器内计算完整文件 MD5，再按缺失分片续传。</p>
+              <label>
+                文件
+                <input type="file" id="chunk-file" name="file" required />
+              </label>
+              <label>
+                OrgTag
+                <input type="text" name="orgTag" placeholder="留空则回填 primary org" />
+              </label>
+              <label class="checkbox-line">
+                <input type="checkbox" name="isPublic" />
+                <span>公开文档</span>
+              </label>
+              <button type="submit">开始分片上传</button>
+              <div class="progress-track">
+                <div class="progress-fill" id="chunk-progress-fill"></div>
+              </div>
+              <div class="progress-meta" id="chunk-progress-text">等待分片上传。</div>
+            </form>
+
+            <div class="tool-grid">
+              <form class="mini-form" id="fast-upload-form">
+                <h3>秒传检查</h3>
+                <label>
+                  文件 MD5
+                  <input type="text" name="md5" placeholder="上传后返回的 fileMd5" required />
+                </label>
+                <button type="submit">检查</button>
+              </form>
+
+              <form class="mini-form" id="upload-status-form">
+                <h3>上传进度</h3>
+                <label>
+                  文件 MD5
+                  <input type="text" name="fileMd5" placeholder="查询断点上传状态" required />
+                </label>
+                <button type="submit">查询</button>
+              </form>
+            </div>
+
+            <pre class="result-box" id="upload-tool-result">等待操作。</pre>
+          </div>
+        </section>
+
+        <section class="card panel" id="documents-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Documents</p>
+              <h2>文档列表</h2>
+            </div>
+            <div class="button-row">
+              <button class="secondary-button" id="load-accessible-docs">可访问文档</button>
+              <button class="secondary-button" id="load-uploaded-docs">我的上传</button>
+            </div>
+          </div>
+
+          <div class="document-columns">
+            <div>
+              <h3>可访问文档</h3>
+              <div class="list-shell" id="accessible-documents"></div>
+            </div>
+            <div>
+              <h3>我的上传</h3>
+              <div class="list-shell" id="uploaded-documents"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card panel" id="search-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Search</p>
+              <h2>混合检索</h2>
+            </div>
+          </div>
+
+          <form class="mini-form inline-form" id="search-form">
+            <label class="grow">
+              查询
+              <input type="text" name="query" placeholder="例如：如何配置 MinIO 上传链路" required />
+            </label>
+            <label>
+              TopK
+              <input type="number" name="topK" min="1" max="50" value="6" />
+            </label>
+            <button type="submit">执行搜索</button>
+          </form>
+
+          <div class="list-shell search-results" id="search-results"></div>
+        </section>
+
+        <section class="card panel wide-panel" id="chat-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Chat</p>
+              <h2>RAG 对话</h2>
+            </div>
+            <div class="button-row">
+              <button class="secondary-button" id="connect-chat">连接聊天</button>
+              <button class="secondary-button" id="stop-chat">停止生成</button>
+            </div>
+          </div>
+
+          <div class="chat-layout">
+            <div class="chat-column">
+              <div class="chat-stream" id="chat-stream"></div>
+              <form class="mini-form chat-form" id="chat-form">
+                <label>
+                  提问
+                  <textarea name="question" rows="3" placeholder="输入问题，服务端会先做 Hybrid Search，再走 WebSocket 流式回答。" required></textarea>
+                </label>
+                <button type="submit">发送消息</button>
+              </form>
+            </div>
+
+            <div class="chat-column">
+              <div class="panel-head compact">
+                <div>
+                  <p class="eyebrow">History</p>
+                  <h3>HTTP 会话历史</h3>
+                </div>
+                <button class="secondary-button" id="load-history">刷新历史</button>
+              </div>
+              <div class="history-stream" id="history-stream"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card panel wide-panel hidden" id="admin-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Admin</p>
+              <h2>管理员视图</h2>
+            </div>
+            <div class="button-row">
+              <button class="secondary-button" id="load-admin-users">用户</button>
+              <button class="secondary-button" id="load-admin-tags">组织标签</button>
+              <button class="secondary-button" id="load-admin-conversations">会话审计</button>
+            </div>
+          </div>
+
+          <div class="admin-grid">
+            <div class="stack">
+              <h3>用户列表</h3>
+              <form class="mini-form" id="assign-org-tags-form">
+                <label>
+                  用户 ID
+                  <input type="number" name="userId" min="1" placeholder="例如 27" required />
+                </label>
+                <label>
+                  OrgTags
+                  <input type="text" name="orgTags" placeholder="逗号分隔，如 root,team-a" />
+                </label>
+                <button type="submit">分配标签</button>
+              </form>
+              <div class="list-shell" id="admin-users"></div>
+            </div>
+            <div class="stack">
+              <h3>组织树</h3>
+              <form class="mini-form" id="create-org-tag-form">
+                <label>
+                  TagID
+                  <input type="text" name="tagId" placeholder="例如 team-demo" required />
+                </label>
+                <label>
+                  名称
+                  <input type="text" name="name" placeholder="展示名称" required />
+                </label>
+                <label>
+                  描述
+                  <input type="text" name="description" placeholder="可选" />
+                </label>
+                <label>
+                  ParentTag
+                  <input type="text" name="parentTag" placeholder="可选父节点 tagId" />
+                </label>
+                <button type="submit">创建组织标签</button>
+              </form>
+              <form class="mini-form" id="delete-org-tag-form">
+                <label>
+                  TagID
+                  <input type="text" name="tagId" placeholder="待删除 tagId" required />
+                </label>
+                <label>
+                  删除策略
+                  <select name="strategy">
+                    <option value="protect">protect</option>
+                    <option value="reparent">reparent</option>
+                  </select>
+                </label>
+                <button type="submit">删除组织标签</button>
+              </form>
+              <div class="list-shell" id="admin-tags"></div>
+            </div>
+            <div class="stack">
+              <h3>会话审计</h3>
+              <form class="mini-form" id="admin-conversation-filter-form">
+                <label>
+                  用户 ID
+                  <input type="number" name="userId" min="1" placeholder="可选" />
+                </label>
+                <label>
+                  开始日期
+                  <input type="date" name="startDate" />
+                </label>
+                <label>
+                  结束日期
+                  <input type="date" name="endDate" />
+                </label>
+                <button type="submit">按条件查询会话</button>
+              </form>
+              <form class="mini-form" id="admin-delete-document-form">
+                <label>
+                  目标用户 ID
+                  <input type="number" name="userId" min="1" placeholder="文件所有者 ID" required />
+                </label>
+                <label>
+                  文件 MD5
+                  <input type="text" name="fileMd5" placeholder="目标文件 fileMd5" required />
+                </label>
+                <button type="submit">管理员删除文档</button>
+              </form>
+              <div class="list-shell" id="admin-conversations"></div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <aside class="status-console card">
+        <div class="panel-head compact">
+          <div>
+            <p class="eyebrow">Console</p>
+            <h2>联调状态</h2>
+          </div>
+          <button class="secondary-button" id="clear-console">清空</button>
+        </div>
+        <div id="console-log" class="console-log"></div>
+      </aside>
+    </div>
+
+    <dialog id="preview-dialog" class="preview-dialog">
+      <form method="dialog" class="preview-toolbar">
+        <h3 id="preview-title">文档预览</h3>
+        <button class="secondary-button" value="cancel">关闭</button>
+      </form>
+      <pre id="preview-content"></pre>
+    </dialog>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
