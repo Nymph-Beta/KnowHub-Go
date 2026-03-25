@@ -26,6 +26,7 @@ type Processor struct {
 	tikaClient    *tika.Client
 	minioClient   *minio.Client
 	bucketName    string
+	uploadRepo    repository.UploadRepository
 	docVectorRepo repository.DocumentVectorRepository
 	embedding     embedding.Client
 	esClient      es.Client
@@ -36,6 +37,7 @@ func NewProcessor(
 	tikaClient *tika.Client,
 	minioClient *minio.Client,
 	bucketName string,
+	uploadRepo repository.UploadRepository,
 	docVectorRepo repository.DocumentVectorRepository,
 	embeddingClient embedding.Client,
 	esClient es.Client,
@@ -45,6 +47,7 @@ func NewProcessor(
 		tikaClient:    tikaClient,
 		minioClient:   minioClient,
 		bucketName:    bucketName,
+		uploadRepo:    uploadRepo,
 		docVectorRepo: docVectorRepo,
 		embedding:     embeddingClient,
 		esClient:      esClient,
@@ -59,6 +62,9 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 	if p.minioClient == nil {
 		return fmt.Errorf("minio client is nil")
 	}
+	if p.uploadRepo == nil {
+		return fmt.Errorf("upload repository is nil")
+	}
 	if p.docVectorRepo == nil {
 		return fmt.Errorf("document vector repository is nil")
 	}
@@ -71,6 +77,15 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 	if strings.TrimSpace(task.ObjectKey) == "" {
 		return fmt.Errorf("object key is empty")
 	}
+	if err := p.updateProcessingStatus(task, model.FileProcessingStatusProcessing); err != nil {
+		return err
+	}
+	finalStatus := model.FileProcessingStatusFailed
+	defer func() {
+		if err := p.updateProcessingStatus(task, finalStatus); err != nil {
+			log.Errorf("[Processor] 更新处理状态失败: md5=%s status=%s err=%v", task.FileMD5, finalStatus, err)
+		}
+	}()
 
 	log.Infof("[Processor] 开始处理文件: md5=%s objectKey=%s", task.FileMD5, task.ObjectKey)
 
@@ -94,6 +109,7 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 
 	if strings.TrimSpace(text) == "" {
 		log.Warnf("[Processor] 文本为空，跳过分块: md5=%s", task.FileMD5)
+		finalStatus = model.FileProcessingStatusEmpty
 		return nil
 	}
 
@@ -103,6 +119,7 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 	}
 	if len(chunks) == 0 {
 		log.Warnf("[Processor] 分块结果为空，跳过写库: md5=%s", task.FileMD5)
+		finalStatus = model.FileProcessingStatusEmpty
 		return nil
 	}
 
@@ -124,6 +141,7 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 	}
 	if len(persistedVectors) == 0 {
 		log.Warnf("[Processor] 未找到已写入的 chunk，跳过向量化: md5=%s", task.FileMD5)
+		finalStatus = model.FileProcessingStatusEmpty
 		return nil
 	}
 
@@ -139,7 +157,12 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 
 	log.Infof("[Processor] Elasticsearch 索引成功: md5=%s, docs=%d, index=%s", task.FileMD5, len(esDocs), p.esClient.IndexName())
 	log.Infof("[Processor] 文件处理成功完成: md5=%s", task.FileMD5)
+	finalStatus = model.FileProcessingStatusIndexed
 	return nil
+}
+
+func (p *Processor) updateProcessingStatus(task tasks.FileProcessingTask, status string) error {
+	return p.uploadRepo.UpdateFileProcessingStatus(task.FileMD5, task.UserID, status)
 }
 
 func splitText(text string, chunkSize int, overlap int) ([]string, error) {
