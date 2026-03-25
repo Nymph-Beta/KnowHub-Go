@@ -13,10 +13,10 @@ import (
 )
 
 type fakeDocumentServiceForHandler struct {
-	listAccessibleFilesFn  func(ctx context.Context, user *model.User) ([]service.FileUploadDTO, error)
-	listUploadedFilesFn    func(ctx context.Context, userID uint) ([]service.FileUploadDTO, error)
-	deleteDocumentFn       func(ctx context.Context, fileMD5 string, user *model.User) error
-	generateDownloadURLFn  func(ctx context.Context, fileMD5 string, fileName string, user *model.User) (*service.DownloadInfoDTO, error)
+	listAccessibleFilesFn   func(ctx context.Context, user *model.User) ([]service.FileUploadDTO, error)
+	listUploadedFilesFn     func(ctx context.Context, userID uint) ([]service.FileUploadDTO, error)
+	deleteDocumentFn        func(ctx context.Context, fileMD5 string, user *model.User, targetUserID *uint) error
+	generateDownloadURLFn   func(ctx context.Context, fileMD5 string, fileName string, user *model.User) (*service.DownloadInfoDTO, error)
 	getFilePreviewContentFn func(ctx context.Context, fileMD5 string, fileName string, user *model.User) (*service.PreviewInfoDTO, error)
 }
 
@@ -34,9 +34,9 @@ func (f *fakeDocumentServiceForHandler) ListUploadedFiles(ctx context.Context, u
 	return []service.FileUploadDTO{}, nil
 }
 
-func (f *fakeDocumentServiceForHandler) DeleteDocument(ctx context.Context, fileMD5 string, user *model.User) error {
+func (f *fakeDocumentServiceForHandler) DeleteDocument(ctx context.Context, fileMD5 string, user *model.User, targetUserID *uint) error {
 	if f.deleteDocumentFn != nil {
-		return f.deleteDocumentFn(ctx, fileMD5, user)
+		return f.deleteDocumentFn(ctx, fileMD5, user, targetUserID)
 	}
 	return nil
 }
@@ -95,7 +95,7 @@ func TestDocumentHandler_GenerateDownloadURL_MissingQuery(t *testing.T) {
 
 func TestDocumentHandler_DeleteDocument_ErrorMapping(t *testing.T) {
 	r := newDocumentRouter(NewDocumentHandler(&fakeDocumentServiceForHandler{
-		deleteDocumentFn: func(ctx context.Context, fileMD5 string, user *model.User) error {
+		deleteDocumentFn: func(ctx context.Context, fileMD5 string, user *model.User, targetUserID *uint) error {
 			return service.ErrFileNotFound
 		},
 	}))
@@ -105,5 +105,34 @@ func TestDocumentHandler_DeleteDocument_ErrorMapping(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expect 404, got %d, body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestDocumentHandler_DeleteDocument_AdminTargetUser(t *testing.T) {
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("user", &model.User{ID: 1, Username: "admin", Role: "ADMIN"})
+		c.Next()
+	})
+
+	var gotTargetUserID *uint
+	r.DELETE("/documents/:fileMd5", NewDocumentHandler(&fakeDocumentServiceForHandler{
+		deleteDocumentFn: func(ctx context.Context, fileMD5 string, user *model.User, targetUserID *uint) error {
+			if fileMD5 != "md5v" || user.Role != "ADMIN" {
+				t.Fatalf("unexpected args: md5=%s user=%+v", fileMD5, user)
+			}
+			gotTargetUserID = targetUserID
+			return nil
+		},
+	}).DeleteDocument)
+
+	req := httptest.NewRequest(http.MethodDelete, "/documents/md5v?userId=42", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expect 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+	if gotTargetUserID == nil || *gotTargetUserID != 42 {
+		t.Fatalf("unexpected target user id: %v", gotTargetUserID)
 	}
 }

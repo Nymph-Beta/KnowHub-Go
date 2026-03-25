@@ -61,7 +61,7 @@ type documentESClient interface {
 type DocumentService interface {
 	ListAccessibleFiles(ctx context.Context, user *model.User) ([]FileUploadDTO, error)
 	ListUploadedFiles(ctx context.Context, userID uint) ([]FileUploadDTO, error)
-	DeleteDocument(ctx context.Context, fileMD5 string, user *model.User) error
+	DeleteDocument(ctx context.Context, fileMD5 string, user *model.User, targetUserID *uint) error
 	GenerateDownloadURL(ctx context.Context, fileMD5 string, fileName string, user *model.User) (*DownloadInfoDTO, error)
 	GetFilePreviewContent(ctx context.Context, fileMD5 string, fileName string, user *model.User) (*PreviewInfoDTO, error)
 }
@@ -165,7 +165,7 @@ func (s *documentService) ListUploadedFiles(ctx context.Context, userID uint) ([
 	return s.mapFileUploadsToDTOs(files)
 }
 
-func (s *documentService) DeleteDocument(ctx context.Context, fileMD5 string, user *model.User) error {
+func (s *documentService) DeleteDocument(ctx context.Context, fileMD5 string, user *model.User, targetUserID *uint) error {
 	if s.uploadRepo == nil || s.docVectorRepo == nil || s.esClient == nil || s.minioClient == nil {
 		return ErrServiceUnavailable
 	}
@@ -173,10 +173,9 @@ func (s *documentService) DeleteDocument(ctx context.Context, fileMD5 string, us
 		return ErrInvalidInput
 	}
 
-	upload, err := s.uploadRepo.FindByFileMD5AndUserID(strings.TrimSpace(fileMD5), user.ID)
+	upload, err := s.resolveDeletionTarget(strings.TrimSpace(fileMD5), user, targetUserID)
 	if err != nil {
-		log.Warnf("DeleteDocument: find upload failed: user=%d md5=%s err=%v", user.ID, fileMD5, err)
-		return ErrFileNotFound
+		return err
 	}
 
 	if err := s.esClient.DeleteDocumentsByFileMD5(ctx, upload.FileMD5); err != nil {
@@ -218,6 +217,43 @@ func (s *documentService) DeleteDocument(ctx context.Context, fileMD5 string, us
 		return ErrInternal
 	}
 	return nil
+}
+
+func (s *documentService) resolveDeletionTarget(fileMD5 string, user *model.User, targetUserID *uint) (*model.FileUpload, error) {
+	lookup := func(ownerUserID uint) (*model.FileUpload, error) {
+		upload, err := s.uploadRepo.FindByFileMD5AndUserID(fileMD5, ownerUserID)
+		if err != nil {
+			if strings.EqualFold(user.Role, "ADMIN") {
+				log.Warnf("DeleteDocument: find upload failed: actor=%d target=%d md5=%s err=%v", user.ID, ownerUserID, fileMD5, err)
+			} else {
+				log.Warnf("DeleteDocument: find upload failed: user=%d md5=%s err=%v", user.ID, fileMD5, err)
+			}
+			return nil, ErrFileNotFound
+		}
+		return upload, nil
+	}
+
+	if !strings.EqualFold(user.Role, "ADMIN") {
+		return lookup(user.ID)
+	}
+
+	if targetUserID != nil && *targetUserID != 0 {
+		return lookup(*targetUserID)
+	}
+
+	uploads, err := s.uploadRepo.FindBatchByMD5s([]string{fileMD5})
+	if err != nil {
+		log.Errorf("DeleteDocument: admin batch lookup failed: md5=%s err=%v", fileMD5, err)
+		return nil, ErrInternal
+	}
+	switch len(uploads) {
+	case 0:
+		return nil, ErrFileNotFound
+	case 1:
+		return &uploads[0], nil
+	default:
+		return nil, fmt.Errorf("%w: ambiguous file ownership, please specify userId", ErrInvalidInput)
+	}
 }
 
 func (s *documentService) GenerateDownloadURL(ctx context.Context, fileMD5 string, fileName string, user *model.User) (*DownloadInfoDTO, error) {

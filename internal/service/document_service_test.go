@@ -201,7 +201,7 @@ func TestDocumentService_DeleteDocument_CompleteCleanup(t *testing.T) {
 		},
 	)
 
-	err := svc.DeleteDocument(context.Background(), "md5v", &model.User{ID: 5})
+	err := svc.DeleteDocument(context.Background(), "md5v", &model.User{ID: 5}, nil)
 	if err != nil {
 		t.Fatalf("DeleteDocument() error = %v", err)
 	}
@@ -274,8 +274,64 @@ func TestDocumentService_DeleteDocument_NotFound(t *testing.T) {
 		&fakeDocumentESClient{},
 	)
 
-	err := svc.DeleteDocument(context.Background(), "missing", &model.User{ID: 1})
+	err := svc.DeleteDocument(context.Background(), "missing", &model.User{ID: 1}, nil)
 	if !errors.Is(err, ErrFileNotFound) {
 		t.Fatalf("expected ErrFileNotFound, got %v", err)
+	}
+}
+
+func TestDocumentService_DeleteDocument_AdminDeleteByTargetUser(t *testing.T) {
+	var gotUserID uint
+	svc := NewDocumentService(
+		&fakeUploadRepo{
+			findByFileMD5AndUserIDFn: func(fileMD5 string, userID uint) (*model.FileUpload, error) {
+				gotUserID = userID
+				return &model.FileUpload{FileMD5: fileMD5, FileName: "doc.pdf", UserID: userID}, nil
+			},
+			findChunksByFileMD5Fn: func(fileMD5 string) ([]model.ChunkInfo, error) {
+				return []model.ChunkInfo{}, nil
+			},
+		},
+		&fakeOrgTagRepo{},
+		&fakeDocumentUserTagProvider{},
+		&fakeDocumentStorage{},
+		"bucket-a",
+		&fakeDocumentTextExtractor{},
+		&fakeDocumentVectorRepo{},
+		&fakeDocumentESClient{},
+	)
+
+	targetUserID := uint(42)
+	err := svc.DeleteDocument(context.Background(), "md5v", &model.User{ID: 1, Role: "ADMIN"}, &targetUserID)
+	if err != nil {
+		t.Fatalf("DeleteDocument() error = %v", err)
+	}
+	if gotUserID != 42 {
+		t.Fatalf("expected delete target user 42, got %d", gotUserID)
+	}
+}
+
+func TestDocumentService_DeleteDocument_AdminAmbiguousFileOwnership(t *testing.T) {
+	svc := NewDocumentService(
+		&fakeUploadRepo{
+			findBatchByMD5sFn: func(fileMD5s []string) ([]model.FileUpload, error) {
+				return []model.FileUpload{
+					{FileMD5: "md5v", UserID: 2},
+					{FileMD5: "md5v", UserID: 3},
+				}, nil
+			},
+		},
+		&fakeOrgTagRepo{},
+		&fakeDocumentUserTagProvider{},
+		&fakeDocumentStorage{},
+		"bucket-a",
+		&fakeDocumentTextExtractor{},
+		&fakeDocumentVectorRepo{},
+		&fakeDocumentESClient{},
+	)
+
+	err := svc.DeleteDocument(context.Background(), "md5v", &model.User{ID: 1, Role: "ADMIN"}, nil)
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
 	}
 }

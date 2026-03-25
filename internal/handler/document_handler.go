@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"pai_smart_go_v2/internal/service"
@@ -86,7 +87,22 @@ func (h *DocumentHandler) DeleteDocument(c *gin.Context) {
 		return
 	}
 
-	if err := h.documentService.DeleteDocument(c.Request.Context(), fileMD5, user); err != nil {
+	var targetUserID *uint
+	if raw := strings.TrimSpace(c.Query("userId")); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":    http.StatusBadRequest,
+				"error":   http.StatusText(http.StatusBadRequest),
+				"message": "Query parameter 'userId' must be an unsigned integer",
+			})
+			return
+		}
+		value := uint(parsed)
+		targetUserID = &value
+	}
+
+	if err := h.documentService.DeleteDocument(c.Request.Context(), fileMD5, user, targetUserID); err != nil {
 		log.Warnf("DeleteDocument: user=%d md5=%s err=%v", user.ID, fileMD5, err)
 		status, msg := mapServiceError(err)
 		c.JSON(status, gin.H{"code": status, "error": http.StatusText(status), "message": msg})
