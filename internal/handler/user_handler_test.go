@@ -19,6 +19,7 @@ import (
 type fakeUserService struct {
 	registerFn             func(username, password string) (*model.User, error)
 	loginFn                func(username, password string) (string, string, error)
+	refreshTokenFn         func(refreshToken string) (string, string, error)
 	getProfileFn           func(username string) (*model.User, error)
 	findByIDFn             func(userID uint) (*model.User, error)
 	logoutFn               func(token string) error
@@ -39,6 +40,13 @@ func (f *fakeUserService) Register(username, password string) (*model.User, erro
 func (f *fakeUserService) Login(username, password string) (string, string, error) {
 	if f.loginFn != nil {
 		return f.loginFn(username, password)
+	}
+	return "", "", nil
+}
+
+func (f *fakeUserService) RefreshToken(refreshToken string) (string, string, error) {
+	if f.refreshTokenFn != nil {
+		return f.refreshTokenFn(refreshToken)
 	}
 	return "", "", nil
 }
@@ -109,6 +117,7 @@ func newRouter(h *UserHandler) *gin.Engine {
 	r := gin.New()
 	r.POST("/register", h.Register)
 	r.POST("/login", h.Login)
+	r.POST("/refresh", h.RefreshToken)
 	r.GET("/profile", h.GetProfile)
 	return r
 }
@@ -266,6 +275,57 @@ func TestLogin_Success(t *testing.T) {
 	}
 	if data["refreshToken"] != "refresh-token" {
 		t.Fatalf("expect refreshToken='refresh-token', got %v", data["refreshToken"])
+	}
+}
+
+func TestRefreshToken_InvalidBody(t *testing.T) {
+	svc := &fakeUserService{}
+	r := newRouter(NewUserHandler(svc))
+
+	w := doReq(r, http.MethodPost, "/refresh", `{}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expect 400, got %d, body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestRefreshToken_InvalidToken(t *testing.T) {
+	svc := &fakeUserService{
+		refreshTokenFn: func(refreshToken string) (string, string, error) {
+			return "", "", service.ErrInvalidCredentials
+		},
+	}
+	r := newRouter(NewUserHandler(svc))
+
+	w := doReq(r, http.MethodPost, "/refresh", `{"refreshToken":"bad"}`)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expect 401, got %d, body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestRefreshToken_Success(t *testing.T) {
+	svc := &fakeUserService{
+		refreshTokenFn: func(refreshToken string) (string, string, error) {
+			if refreshToken != "refresh-token" {
+				t.Fatalf("unexpected refresh token: %s", refreshToken)
+			}
+			return "new-access", "new-refresh", nil
+		},
+	}
+	r := newRouter(NewUserHandler(svc))
+
+	w := doReq(r, http.MethodPost, "/refresh", `{"refreshToken":"refresh-token"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expect 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	data, ok := resp["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("expect data to be map, got %T", resp["data"])
+	}
+	if data["accessToken"] != "new-access" || data["refreshToken"] != "new-refresh" {
+		t.Fatalf("unexpected refresh payload: %+v", data)
 	}
 }
 

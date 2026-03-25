@@ -62,6 +62,7 @@ type UserDetailDTO struct {
 type UserService interface {
 	Register(username, password string) (*model.User, error)
 	Login(username, password string) (accessToken, refreshToken string, err error)
+	RefreshToken(refreshToken string) (accessToken, newRefreshToken string, err error)
 	GetProfile(username string) (*model.User, error)
 	FindByID(userID uint) (*model.User, error)
 
@@ -180,6 +181,41 @@ func (s *userService) Login(username, password string) (accessToken, refreshToke
 		return "", "", ErrInternal
 	}
 	return accessToken, refreshToken, nil
+}
+
+func (s *userService) RefreshToken(refreshToken string) (accessToken, newRefreshToken string, err error) {
+	if s.JWTManager == nil || s.userRepo == nil {
+		return "", "", ErrInternal
+	}
+
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return "", "", ErrInvalidInput
+	}
+
+	claims, err := s.JWTManager.VerifyToken(refreshToken)
+	if err != nil || claims == nil || claims.TokenType != token.TokenTypeRefresh {
+		return "", "", ErrInvalidCredentials
+	}
+
+	user, err := s.userRepo.FindByID(claims.UserID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", "", ErrInvalidCredentials
+		}
+		log.Errorf("RefreshToken: failed to query user %d: %v", claims.UserID, err)
+		return "", "", ErrInternal
+	}
+	if user == nil {
+		return "", "", ErrInvalidCredentials
+	}
+
+	accessToken, newRefreshToken, err = s.JWTManager.GenerateToken(user.ID, user.Username, user.Role)
+	if err != nil {
+		log.Errorf("RefreshToken: failed to generate token for user %d: %v", user.ID, err)
+		return "", "", ErrInternal
+	}
+	return accessToken, newRefreshToken, nil
 }
 
 func (s *userService) GetProfile(username string) (*model.User, error) {

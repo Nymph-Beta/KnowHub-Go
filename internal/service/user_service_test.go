@@ -264,6 +264,55 @@ func TestUserService_Login_NilJWTManager(t *testing.T) {
 	}
 }
 
+func TestUserService_RefreshToken_Success(t *testing.T) {
+	jm := newJWT()
+	_, refreshToken, err := jm.GenerateToken(7, "alice", "USER")
+	if err != nil {
+		t.Fatalf("GenerateToken() error = %v", err)
+	}
+
+	repo := &fakeUserRepo{
+		findByIDFn: func(userID uint) (*model.User, error) {
+			if userID != 7 {
+				t.Fatalf("unexpected user id: %d", userID)
+			}
+			return &model.User{ID: 7, Username: "alice", Role: "USER"}, nil
+		},
+	}
+	svc := NewUserService(repo, &fakeOrgTagRepo{}, jm)
+
+	accessToken, nextRefreshToken, err := svc.RefreshToken(refreshToken)
+	if err != nil {
+		t.Fatalf("RefreshToken() error = %v", err)
+	}
+	if accessToken == "" || nextRefreshToken == "" {
+		t.Fatal("expected refreshed tokens")
+	}
+
+	claims, err := jm.VerifyToken(accessToken)
+	if err != nil {
+		t.Fatalf("VerifyToken(accessToken) error = %v", err)
+	}
+	if claims.TokenType != token.TokenTypeAccess || claims.UserID != 7 {
+		t.Fatalf("unexpected access claims: %+v", claims)
+	}
+}
+
+func TestUserService_RefreshToken_RejectAccessToken(t *testing.T) {
+	jm := newJWT()
+	accessToken, _, err := jm.GenerateToken(7, "alice", "USER")
+	if err != nil {
+		t.Fatalf("GenerateToken() error = %v", err)
+	}
+
+	svc := NewUserService(&fakeUserRepo{}, &fakeOrgTagRepo{}, jm)
+
+	_, _, err = svc.RefreshToken(accessToken)
+	if !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("expect ErrInvalidCredentials, got %v", err)
+	}
+}
+
 func TestUserService_Register_DBErrorOnFind(t *testing.T) {
 	repo := &fakeUserRepo{
 		findByUsernameFn: func(username string) (*model.User, error) {

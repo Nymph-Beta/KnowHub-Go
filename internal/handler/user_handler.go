@@ -36,6 +36,10 @@ type LoginRequest struct {
 	Password string `json:"password" binding:"required"`
 }
 
+type RefreshTokenRequest struct {
+	RefreshToken string `json:"refreshToken" binding:"required"`
+}
+
 // ProfileResponse 是个人信息接口响应结构。
 // 与 model.User 的主要区别是 OrgTags 已转换为 string 数组。
 type ProfileResponse struct {
@@ -114,6 +118,46 @@ func (h *UserHandler) Login(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"code":    http.StatusOK,
 		"message": "Login successful",
+		"data": gin.H{
+			"accessToken":  accessToken,
+			"refreshToken": refreshToken,
+		},
+	})
+}
+
+func (h *UserHandler) RefreshToken(c *gin.Context) {
+	var req RefreshTokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Warnf("RefreshToken: failed to bind request: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"code":    http.StatusBadRequest,
+			"message": "Invalid request body",
+		})
+		return
+	}
+
+	accessToken, refreshToken, err := h.userService.RefreshToken(req.RefreshToken)
+	if err != nil {
+		if err == service.ErrInvalidCredentials {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"code":    http.StatusUnauthorized,
+				"message": "Invalid refresh token",
+			})
+			return
+		}
+
+		log.Warnf("RefreshToken: failed to refresh token: %v", err)
+		status, msg := mapServiceError(err)
+		c.JSON(status, gin.H{
+			"code":    status,
+			"message": msg,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    http.StatusOK,
+		"message": "Token refreshed successfully",
 		"data": gin.H{
 			"accessToken":  accessToken,
 			"refreshToken": refreshToken,
